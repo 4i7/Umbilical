@@ -28,6 +28,14 @@ PathLike = Union[str, os.PathLike[str]]
 
 _SCHEMA_VERSION = 1
 _MAX_GENERATION = (1 << 63) - 1
+_CREATE_GENERATIONS_SQL = """
+CREATE TABLE controller_generations (
+    scope TEXT NOT NULL PRIMARY KEY
+        CHECK(typeof(scope) = 'text' AND scope <> ''),
+    generation INTEGER NOT NULL
+        CHECK(typeof(generation) = 'integer' AND generation > 0)
+) WITHOUT ROWID
+"""
 
 
 class AuthorityStoreError(RuntimeError):
@@ -92,16 +100,7 @@ class AuthorityStore:
             connection = cls._connect_rw(store_path)
             cls._configure_durability(connection)
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                CREATE TABLE controller_generations (
-                    scope TEXT NOT NULL PRIMARY KEY
-                        CHECK(typeof(scope) = 'text' AND scope <> ''),
-                    generation INTEGER NOT NULL
-                        CHECK(typeof(generation) = 'integer' AND generation > 0)
-                ) WITHOUT ROWID
-                """
-            )
+            connection.execute(_CREATE_GENERATIONS_SQL)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             connection.execute("COMMIT")
             cls._validate_store(connection)
@@ -115,8 +114,8 @@ class AuthorityStore:
             if connection is not None:
                 cls._rollback_if_needed(connection)
                 connection.close()
-            # The reserved path is intentionally left in place.  Removing it
-            # here could turn a failed initialization into a later silent reset.
+            # The reserved path is intentionally left in place. Removing it
+            # could turn failed initialization into a later silent reset.
             raise AuthorityStoreError(
                 f"failed to initialize authority store: {store_path}"
             ) from exc
@@ -131,8 +130,11 @@ class AuthorityStore:
         connection: Optional[sqlite3.Connection] = None
         try:
             connection = cls._connect_rw(store_path)
-            cls._configure_durability(connection)
+            # Validate before any PRAGMA that could modify a valid SQLite file.
+            # A zero-byte or wrong-version store must fail without being turned
+            # into a freshly configured authority database.
             cls._validate_store(connection)
+            cls._configure_durability(connection)
             return cls(store_path, connection)
         except AuthorityStoreError:
             if connection is not None:
@@ -147,11 +149,15 @@ class AuthorityStore:
 
     @staticmethod
     def _normalize_path(path: PathLike) -> Path:
-        return Path(path).expanduser().resolve()
+        # Do not resolve symlinks. O_CREAT|O_EXCL must observe an existing
+        # symlink itself (including a broken one) rather than following it and
+        # treating its absent target as permission to initialize new authority.
+        expanded = os.path.expanduser(os.fspath(path))
+        return Path(os.path.abspath(expanded))
 
     @staticmethod
     def _connect_rw(path: Path) -> sqlite3.Connection:
-        # mode=rw is the critical no-create boundary for open_existing.  It also
+        # mode=rw is the critical no-create boundary for open_existing. It also
         # prevents a TOCTOU disappearance after the existence check from being
         # converted into a fresh empty database.
         uri = f"{path.as_uri()}?mode=rw"
@@ -175,6 +181,10 @@ class AuthorityStore:
         if row is None or row[0] != 2:
             raise AuthorityStoreError("SQLite refused required synchronous=FULL")
 
+    @staticmethod
+    def _normalized_sql(sql: str) -> str:
+        return " ".join(sql.lower().split())
+
     @classmethod
     def _validate_store(cls, connection: sqlite3.Connection) -> None:
         try:
@@ -191,11 +201,18 @@ class AuthorityStore:
                 )
 
             table_row = connection.execute(
-                "SELECT type FROM sqlite_master WHERE name = 'controller_generations'"
+                "SELECT type, sql FROM sqlite_master "
+                "WHERE name = 'controller_generations'"
             ).fetchone()
-            if table_row != ("table",):
+            if table_row is None or table_row[0] != "table" or not isinstance(table_row[1], str):
                 raise AuthorityStoreMalformedError(
                     "missing required controller_generations table"
+                )
+            if cls._normalized_sql(table_row[1]) != cls._normalized_sql(
+                _CREATE_GENERATIONS_SQL
+            ):
+                raise AuthorityStoreMalformedError(
+                    "controller_generations definition does not match U1A schema"
                 )
 
             columns = connection.execute(
@@ -207,7 +224,7 @@ class AuthorityStore:
             ]
             if columns != expected:
                 raise AuthorityStoreMalformedError(
-                    "controller_generations schema does not match U1A"
+                    "controller_generations columns do not match U1A schema"
                 )
 
             rows = connection.execute(

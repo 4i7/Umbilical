@@ -5,12 +5,14 @@
 # Foundation, version 2.
 
 import concurrent.futures
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from buildbot.umbilical_authority import AuthorityStore
+from buildbot.umbilical_authority import AuthorityStoreError
 from buildbot.umbilical_authority import AuthorityStoreExistsError
 from buildbot.umbilical_authority import AuthorityStoreMalformedError
 from buildbot.umbilical_authority import AuthorityStoreMissingError
@@ -24,29 +26,6 @@ class AuthorityStoreTests(unittest.TestCase):
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.path = Path(self._temporary_directory.name) / "authority.sqlite3"
-
-    def _create_manual_store(self, version=1, generation=None, include_table=True):
-        connection = sqlite3.connect(self.path)
-        try:
-            connection.execute(f"PRAGMA user_version = {version}")
-            if include_table:
-                connection.execute(
-                    """
-                    CREATE TABLE controller_generations (
-                        scope TEXT NOT NULL PRIMARY KEY,
-                        generation INTEGER NOT NULL
-                    ) WITHOUT ROWID
-                    """
-                )
-                if generation is not None:
-                    connection.execute(
-                        "INSERT INTO controller_generations(scope, generation) "
-                        "VALUES ('controller/default', ?)",
-                        (generation,),
-                    )
-            connection.commit()
-        finally:
-            connection.close()
 
     def test_initialize_new_empty_store_succeeds(self):
         with AuthorityStore.initialize_new(self.path) as store:
@@ -67,6 +46,18 @@ class AuthorityStoreTests(unittest.TestCase):
             AuthorityStore.initialize_new(self.path)
         with AuthorityStore.open_existing(self.path) as store:
             self.assertEqual(store.read_generation("scope"), 1)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_initialize_does_not_follow_existing_broken_symlink(self):
+        link = Path(self._temporary_directory.name) / "authority-link.sqlite3"
+        target = Path(self._temporary_directory.name) / "missing-target.sqlite3"
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        with self.assertRaises(AuthorityStoreExistsError):
+            AuthorityStore.initialize_new(link)
+        self.assertFalse(target.exists())
 
     def test_open_existing_missing_path_fails(self):
         with self.assertRaises(AuthorityStoreMissingError):
@@ -140,19 +131,68 @@ class AuthorityStoreTests(unittest.TestCase):
             AuthorityStore.open_existing(self.path)
 
     def test_unsupported_schema_version_fails_closed(self):
-        self._create_manual_store(version=999)
+        AuthorityStore.initialize_new(self.path).close()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA user_version = 999")
+            connection.commit()
+        finally:
+            connection.close()
         with self.assertRaises(AuthorityStoreVersionError):
             AuthorityStore.open_existing(self.path)
 
     def test_missing_required_table_fails_closed(self):
-        self._create_manual_store(version=1, include_table=False)
+        AuthorityStore.initialize_new(self.path).close()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DROP TABLE controller_generations")
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_schema_definition_drift_fails_closed(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute(
+                """
+                CREATE TABLE controller_generations (
+                    scope TEXT NOT NULL PRIMARY KEY,
+                    generation INTEGER NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
         with self.assertRaises(AuthorityStoreMalformedError):
             AuthorityStore.open_existing(self.path)
 
     def test_malformed_persisted_generation_fails_closed(self):
-        self._create_manual_store(version=1, generation=0)
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("controller/default"), 1)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "UPDATE controller_generations SET generation = 0 "
+                "WHERE scope = 'controller/default'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
         with self.assertRaises(AuthorityStoreMalformedError):
             AuthorityStore.open_existing(self.path)
+
+    def test_unwritable_connection_acquisition_fails_closed(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            store._connection.execute("PRAGMA query_only = ON")
+            with self.assertRaises(AuthorityStoreError):
+                store.acquire_generation("scope")
+            store._connection.execute("PRAGMA query_only = OFF")
+            self.assertIsNone(store.read_generation("scope"))
 
     def test_generation_overflow_fails_without_modifying_state(self):
         maximum = (1 << 63) - 1
