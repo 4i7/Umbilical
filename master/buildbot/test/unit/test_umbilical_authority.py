@@ -326,6 +326,15 @@ class AuthorityStoreTests(unittest.TestCase):
                 "CREATE INDEX unexpected_index "
                 "ON controller_generations(generation)"
             ),
+            "sqlite-lookalike-trigger": (
+                "CREATE TRIGGER sqliteXrewind "
+                "AFTER UPDATE OF generation ON controller_generations "
+                "BEGIN "
+                "UPDATE controller_generations "
+                "SET generation = OLD.generation "
+                "WHERE scope = NEW.scope; "
+                "END"
+            ),
         }
 
         for kind, ddl in cases.items():

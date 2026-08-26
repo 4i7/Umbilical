@@ -203,14 +203,22 @@ class AuthorityStore:
 
             schema_rows = connection.execute(
                 "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                "ORDER BY type, name"
             ).fetchall()
-            if len(schema_rows) != 1:
+            user_schema_rows = [
+                row
+                for row in schema_rows
+                if not (
+                    isinstance(row[1], str)
+                    and row[1].startswith("sqlite_")
+                )
+            ]
+            if len(user_schema_rows) != 1:
                 raise AuthorityStoreMalformedError(
                     "authority schema contains unexpected persisted objects"
                 )
 
-            object_type, name, table_name, table_sql = schema_rows[0]
+            object_type, name, table_name, table_sql = user_schema_rows[0]
             if (
                 object_type != "table"
                 or name != "controller_generations"
