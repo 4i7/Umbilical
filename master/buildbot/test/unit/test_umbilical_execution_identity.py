@@ -173,7 +173,7 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
         )
         self.assertNotEqual(normal, swapped)
 
-    def test_derived_key_integrates_with_u1b_without_schema_change(self):
+    def test_derived_key_integrates_with_current_v3_authority_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "authority.sqlite3"
             key = self._derive(
@@ -191,7 +191,7 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
                 )
                 self.assertTrue(store.execution_key_exists(key))
                 self.assertEqual(
-                    store._connection.execute("PRAGMA user_version").fetchone(), (2,)
+                    store._connection.execute("PRAGMA user_version").fetchone(), (3,)
                 )
                 self.assertEqual(
                     store._connection.execute(
@@ -200,6 +200,7 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
                     ).fetchall(),
                     [
                         ("table", "controller_generations"),
+                        ("table", "execution_command_bindings"),
                         ("table", "execution_keys"),
                     ],
                 )
@@ -208,6 +209,13 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
                         "PRAGMA table_info(execution_keys)"
                     ).fetchall(),
                     [(0, "execution_key", "TEXT", 1, None, 1)],
+                )
+                self.assertEqual(
+                    store._connection.execute(
+                        "SELECT execution_key, command_spec_hash "
+                        "FROM execution_command_bindings"
+                    ).fetchall(),
+                    [],
                 )
 
 

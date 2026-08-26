@@ -26,10 +26,12 @@ from typing import Union
 
 AuthorityScope = str
 ExecutionKey = str
+CommandSpecHash = str
 PathLike = Union[str, os.PathLike[str]]
 
 _V1_SCHEMA_VERSION = 1
-_SCHEMA_VERSION = 2
+_V2_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_GENERATION = (1 << 63) - 1
 _CREATE_GENERATIONS_SQL = """
 CREATE TABLE controller_generations (
@@ -43,6 +45,14 @@ _CREATE_EXECUTION_KEYS_SQL = """
 CREATE TABLE execution_keys (
     execution_key TEXT NOT NULL PRIMARY KEY
         CHECK(typeof(execution_key) = 'text' AND execution_key <> '')
+) WITHOUT ROWID
+"""
+_CREATE_EXECUTION_COMMAND_BINDINGS_SQL = """
+CREATE TABLE execution_command_bindings (
+    execution_key TEXT NOT NULL PRIMARY KEY
+        CHECK(typeof(execution_key) = 'text' AND execution_key <> ''),
+    command_spec_hash TEXT NOT NULL
+        CHECK(typeof(command_spec_hash) = 'text' AND command_spec_hash <> '')
 ) WITHOUT ROWID
 """
 
@@ -75,6 +85,14 @@ class GenerationOverflowError(AuthorityStoreError):
     """Raised rather than reusing a ControllerGeneration after integer exhaustion."""
 
 
+class ExecutionKeyNotRegisteredError(AuthorityStoreError):
+    """Raised when command identity binding references an unregistered ExecutionKey."""
+
+
+class CommandSpecConflictError(AuthorityStoreError):
+    """Raised when an ExecutionKey is already bound to a different command hash."""
+
+
 class InvalidAuthorityScopeError(ValueError):
     """Raised when a caller supplies an invalid opaque authority scope."""
 
@@ -83,11 +101,22 @@ class InvalidExecutionKeyError(ValueError):
     """Raised when a caller supplies an invalid opaque ExecutionKey."""
 
 
+class InvalidCommandSpecHashError(ValueError):
+    """Raised when a caller supplies an invalid opaque CommandSpecHash."""
+
+
 class ExecutionKeyRegistration(Enum):
     """Durable ExecutionKey registration result, without execution authority."""
 
     NEW = "new"
     DUPLICATE = "duplicate"
+
+
+class CommandSpecBindingResult(Enum):
+    """Durable immutable command-spec binding result, without execution authority."""
+
+    BOUND = "bound"
+    ALREADY_BOUND = "already_bound"
 
 
 class AuthorityStore:
@@ -127,6 +156,7 @@ class AuthorityStore:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(_CREATE_GENERATIONS_SQL)
             connection.execute(_CREATE_EXECUTION_KEYS_SQL)
+            connection.execute(_CREATE_EXECUTION_COMMAND_BINDINGS_SQL)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             cls._validate_store(connection)
             connection.execute("COMMIT")
@@ -175,7 +205,7 @@ class AuthorityStore:
 
     @classmethod
     def migrate_v1_to_v2(cls, path: PathLike) -> None:
-        """Explicitly migrate one exact valid U1A v1 store to U1B v2 in place."""
+        """Explicitly migrate one exact valid U1A v1 store to exact U1B v2."""
         store_path = cls._normalize_path(path)
         if not store_path.exists():
             raise AuthorityStoreMissingError(f"authority store is missing: {store_path}")
@@ -184,9 +214,6 @@ class AuthorityStore:
         commit_started = False
         try:
             connection = cls._connect_rw(store_path)
-            # A read-only version preflight avoids changing WAL configuration on
-            # known non-v1 stores while leaving full v1 validation inside the
-            # writer transaction that protects the migration itself.
             version = cls._read_schema_version(connection)
             if version != _V1_SCHEMA_VERSION:
                 raise AuthorityStoreVersionError(
@@ -197,20 +224,17 @@ class AuthorityStore:
             connection.execute("BEGIN IMMEDIATE")
             cls._validate_v1_store(connection)
             connection.execute(_CREATE_EXECUTION_KEYS_SQL)
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            cls._validate_store(connection)
+            connection.execute(f"PRAGMA user_version = {_V2_SCHEMA_VERSION}")
+            cls._validate_v2_store(connection)
             commit_started = True
             connection.execute("COMMIT")
         except AuthorityStoreError:
             if connection is not None:
                 if commit_started:
-                    # Once COMMIT has been attempted, the caller must not be told
-                    # which schema version won. Discarding the connection avoids
-                    # any silent retry/reset path; explicit inspection can decide.
                     connection.close()
                 else:
                     try:
-                        cls._rollback_migration_if_needed(connection)
+                        cls._rollback_migration_if_needed(connection, "v1-to-v2")
                     finally:
                         connection.close()
             raise
@@ -223,10 +247,65 @@ class AuthorityStore:
                         "inspect the durable store explicitly"
                     ) from exc
                 try:
-                    cls._rollback_migration_if_needed(connection)
+                    cls._rollback_migration_if_needed(connection, "v1-to-v2")
                 finally:
                     connection.close()
             raise AuthorityStoreError("v1-to-v2 authority migration failed") from exc
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.DatabaseError:
+                    pass
+
+    @classmethod
+    def migrate_v2_to_v3(cls, path: PathLike) -> None:
+        """Explicitly migrate one exact valid U1B v2 store to exact U1D v3."""
+        store_path = cls._normalize_path(path)
+        if not store_path.exists():
+            raise AuthorityStoreMissingError(f"authority store is missing: {store_path}")
+
+        connection: Optional[sqlite3.Connection] = None
+        commit_started = False
+        try:
+            connection = cls._connect_rw(store_path)
+            version = cls._read_schema_version(connection)
+            if version != _V2_SCHEMA_VERSION:
+                raise AuthorityStoreVersionError(
+                    f"v2-to-v3 migration requires schema version 2, found {version}"
+                )
+
+            cls._configure_durability(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            cls._validate_v2_store(connection)
+            connection.execute(_CREATE_EXECUTION_COMMAND_BINDINGS_SQL)
+            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            cls._validate_store(connection)
+            commit_started = True
+            connection.execute("COMMIT")
+        except AuthorityStoreError:
+            if connection is not None:
+                if commit_started:
+                    connection.close()
+                else:
+                    try:
+                        cls._rollback_migration_if_needed(connection, "v2-to-v3")
+                    finally:
+                        connection.close()
+            raise
+        except sqlite3.DatabaseError as exc:
+            if connection is not None:
+                if commit_started:
+                    connection.close()
+                    raise AuthorityStoreError(
+                        "v2-to-v3 migration COMMIT outcome is uncertain; "
+                        "inspect the durable store explicitly"
+                    ) from exc
+                try:
+                    cls._rollback_migration_if_needed(connection, "v2-to-v3")
+                finally:
+                    connection.close()
+            raise AuthorityStoreError("v2-to-v3 authority migration failed") from exc
         finally:
             if connection is not None:
                 try:
@@ -292,15 +371,65 @@ class AuthorityStore:
 
     @classmethod
     def _validate_store(cls, connection: sqlite3.Connection) -> None:
-        cls._validate_versioned_store(connection, _SCHEMA_VERSION)
+        # Historical validity is established by historical validators before
+        # reporting that explicit migration is required.
+        version = cls._read_schema_version(connection)
+        if version == _V1_SCHEMA_VERSION:
+            cls._validate_v1_store(connection)
+            raise AuthorityStoreMigrationRequiredError(
+                "authority schema version 1 requires explicit v1-to-v2 migration"
+            )
+        if version == _V2_SCHEMA_VERSION:
+            cls._validate_v2_store(connection)
+            raise AuthorityStoreMigrationRequiredError(
+                "authority schema version 2 requires explicit v2-to-v3 migration"
+            )
+        cls._validate_exact_store(
+            connection,
+            expected_version=3,
+            expected_objects={
+                "controller_generations": _CREATE_GENERATIONS_SQL,
+                "execution_command_bindings": _CREATE_EXECUTION_COMMAND_BINDINGS_SQL,
+                "execution_keys": _CREATE_EXECUTION_KEYS_SQL,
+            },
+            validate_execution_keys=True,
+            validate_command_bindings=True,
+        )
 
     @classmethod
     def _validate_v1_store(cls, connection: sqlite3.Connection) -> None:
-        cls._validate_versioned_store(connection, _V1_SCHEMA_VERSION)
+        cls._validate_exact_store(
+            connection,
+            expected_version=1,
+            expected_objects={
+                "controller_generations": _CREATE_GENERATIONS_SQL,
+            },
+            validate_execution_keys=False,
+            validate_command_bindings=False,
+        )
 
     @classmethod
-    def _validate_versioned_store(
-        cls, connection: sqlite3.Connection, expected_version: int
+    def _validate_v2_store(cls, connection: sqlite3.Connection) -> None:
+        cls._validate_exact_store(
+            connection,
+            expected_version=2,
+            expected_objects={
+                "controller_generations": _CREATE_GENERATIONS_SQL,
+                "execution_keys": _CREATE_EXECUTION_KEYS_SQL,
+            },
+            validate_execution_keys=True,
+            validate_command_bindings=False,
+        )
+
+    @classmethod
+    def _validate_exact_store(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        expected_version: int,
+        expected_objects: dict[str, str],
+        validate_execution_keys: bool,
+        validate_command_bindings: bool,
     ) -> None:
         try:
             integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
@@ -309,10 +438,6 @@ class AuthorityStore:
 
             version = cls._read_schema_version(connection)
             if version != expected_version:
-                if expected_version == _SCHEMA_VERSION and version == _V1_SCHEMA_VERSION:
-                    raise AuthorityStoreMigrationRequiredError(
-                        "authority schema version 1 requires explicit v1-to-v2 migration"
-                    )
                 raise AuthorityStoreVersionError(
                     f"unsupported authority schema version: {version}"
                 )
@@ -329,12 +454,6 @@ class AuthorityStore:
                     and row[1].startswith("sqlite_")
                 )
             ]
-
-            expected_objects = {
-                "controller_generations": _CREATE_GENERATIONS_SQL,
-            }
-            if expected_version == _SCHEMA_VERSION:
-                expected_objects["execution_keys"] = _CREATE_EXECUTION_KEYS_SQL
 
             if len(user_schema_rows) != len(expected_objects):
                 raise AuthorityStoreMalformedError(
@@ -364,8 +483,10 @@ class AuthorityStore:
                 )
 
             cls._validate_controller_generations_table(connection)
-            if expected_version == _SCHEMA_VERSION:
+            if validate_execution_keys:
                 cls._validate_execution_keys_table(connection)
+            if validate_command_bindings:
+                cls._validate_execution_command_bindings_table(connection)
         except AuthorityStoreError:
             raise
         except sqlite3.DatabaseError as exc:
@@ -413,6 +534,38 @@ class AuthorityStore:
         for execution_key, sqlite_type in rows:
             cls._validate_persisted_execution_key(execution_key, sqlite_type)
 
+    @classmethod
+    def _validate_execution_command_bindings_table(
+        cls, connection: sqlite3.Connection
+    ) -> None:
+        columns = connection.execute(
+            "PRAGMA table_info(execution_command_bindings)"
+        ).fetchall()
+        expected = [
+            (0, "execution_key", "TEXT", 1, None, 1),
+            (1, "command_spec_hash", "TEXT", 1, None, 0),
+        ]
+        if columns != expected:
+            raise AuthorityStoreMalformedError(
+                "execution_command_bindings columns do not match U1D schema"
+            )
+
+        rows = connection.execute(
+            "SELECT b.execution_key, typeof(b.execution_key), "
+            "b.command_spec_hash, typeof(b.command_spec_hash), "
+            "e.execution_key "
+            "FROM execution_command_bindings AS b "
+            "LEFT JOIN execution_keys AS e "
+            "ON e.execution_key = b.execution_key"
+        ).fetchall()
+        for execution_key, key_type, command_spec_hash, hash_type, registered_key in rows:
+            cls._validate_persisted_execution_key(execution_key, key_type)
+            cls._validate_persisted_command_spec_hash(command_spec_hash, hash_type)
+            if registered_key is None:
+                raise AuthorityStoreMalformedError(
+                    "persisted command binding references an unregistered ExecutionKey"
+                )
+
     @staticmethod
     def _validate_scope(scope: AuthorityScope) -> None:
         if not isinstance(scope, str) or scope == "":
@@ -424,6 +577,19 @@ class AuthorityStore:
             raise InvalidExecutionKeyError(
                 "ExecutionKey must be an exact non-empty string"
             )
+
+    @staticmethod
+    def _validate_command_spec_hash(command_spec_hash: CommandSpecHash) -> None:
+        if type(command_spec_hash) is not str or command_spec_hash == "":
+            raise InvalidCommandSpecHashError(
+                "CommandSpecHash must be an exact non-empty string"
+            )
+        try:
+            command_spec_hash.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise InvalidCommandSpecHashError(
+                "CommandSpecHash must be strictly UTF-8 encodable"
+            ) from exc
 
     @staticmethod
     def _validate_persisted_execution_key(
@@ -438,6 +604,26 @@ class AuthorityStore:
                 "persisted ExecutionKey must be a non-empty TEXT value"
             )
         return execution_key
+
+    @staticmethod
+    def _validate_persisted_command_spec_hash(
+        command_spec_hash: object, sqlite_type: object
+    ) -> str:
+        if (
+            sqlite_type != "text"
+            or type(command_spec_hash) is not str
+            or command_spec_hash == ""
+        ):
+            raise AuthorityStoreMalformedError(
+                "persisted CommandSpecHash must be a non-empty TEXT value"
+            )
+        try:
+            command_spec_hash.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise AuthorityStoreMalformedError(
+                "persisted CommandSpecHash must be strictly UTF-8 encodable"
+            ) from exc
+        return command_spec_hash
 
     @staticmethod
     def _validate_persisted_generation(generation: object, sqlite_type: object) -> int:
@@ -462,17 +648,20 @@ class AuthorityStore:
                 pass
 
     @staticmethod
-    def _rollback_migration_if_needed(connection: sqlite3.Connection) -> None:
+    def _rollback_migration_if_needed(
+        connection: sqlite3.Connection, migration_name: str
+    ) -> None:
         if connection.in_transaction:
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.DatabaseError as exc:
                 raise AuthorityStoreError(
-                    "v1-to-v2 migration rollback failed; durable outcome requires inspection"
+                    f"{migration_name} migration rollback failed; "
+                    "durable outcome requires inspection"
                 ) from exc
             if connection.in_transaction:
                 raise AuthorityStoreError(
-                    "v1-to-v2 migration remained active after rollback; "
+                    f"{migration_name} migration remained active after rollback; "
                     "durable outcome requires inspection"
                 )
 
@@ -521,9 +710,6 @@ class AuthorityStore:
         connection = self._require_usable_connection()
         self._validate_scope(scope)
         try:
-            # BEGIN IMMEDIATE serializes ordinary SQLite writers before the
-            # final schema/state validation. No accepted persistent schema
-            # mutation can then interpose before this acquisition commits.
             connection.execute("BEGIN IMMEDIATE")
             self._validate_store(connection)
 
@@ -570,10 +756,6 @@ class AuthorityStore:
         connection = self._require_usable_connection()
         self._validate_scope(scope)
         try:
-            # A deferred read transaction is enough here: the first validation
-            # read establishes the WAL snapshot, and full validation plus the
-            # generation lookup then observe that same snapshot. This is an
-            # observation, not a writer-excluding consequential authority fence.
             connection.execute("BEGIN")
             self._validate_store(connection)
             row = connection.execute(
@@ -585,8 +767,6 @@ class AuthorityStore:
                 generation = None
             else:
                 generation = self._validate_persisted_generation(row[0], row[1])
-            # Do not return observed evidence unless the read transaction has
-            # finished normally. A failed COMMIT enters the common cleanup path.
             connection.execute("COMMIT")
             return generation
         except AuthorityStoreError:
@@ -674,6 +854,115 @@ class AuthorityStore:
         except sqlite3.DatabaseError as exc:
             self._rollback_after_failure(connection)
             raise AuthorityStoreError("ExecutionKey existence read failed") from exc
+
+    def bind_command_spec_hash(
+        self,
+        execution_key: ExecutionKey,
+        command_spec_hash: CommandSpecHash,
+    ) -> CommandSpecBindingResult:
+        """Bind one registered ExecutionKey to one immutable opaque CommandSpecHash."""
+        connection = self._require_usable_connection()
+        self._validate_execution_key(execution_key)
+        self._validate_command_spec_hash(command_spec_hash)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store(connection)
+
+            registered = connection.execute(
+                "SELECT execution_key, typeof(execution_key) "
+                "FROM execution_keys WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if registered is None:
+                raise ExecutionKeyNotRegisteredError(
+                    "CommandSpecHash binding requires a registered ExecutionKey"
+                )
+            persisted_key = self._validate_persisted_execution_key(
+                registered[0], registered[1]
+            )
+            if persisted_key != execution_key:
+                raise AuthorityStoreMalformedError(
+                    "ExecutionKey lookup violated exact identity semantics"
+                )
+
+            row = connection.execute(
+                "SELECT command_spec_hash, typeof(command_spec_hash) "
+                "FROM execution_command_bindings WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO execution_command_bindings"
+                    "(execution_key, command_spec_hash) VALUES (?, ?)",
+                    (execution_key, command_spec_hash),
+                )
+                result = CommandSpecBindingResult.BOUND
+            else:
+                persisted_hash = self._validate_persisted_command_spec_hash(
+                    row[0], row[1]
+                )
+                if persisted_hash != command_spec_hash:
+                    raise CommandSpecConflictError(
+                        "ExecutionKey is already bound to a different CommandSpecHash"
+                    )
+                result = CommandSpecBindingResult.ALREADY_BOUND
+
+            connection.execute("COMMIT")
+            return result
+        except AuthorityStoreError:
+            self._rollback_after_failure(connection)
+            raise
+        except sqlite3.DatabaseError as exc:
+            self._rollback_after_failure(connection)
+            raise AuthorityStoreError("CommandSpecHash binding failed") from exc
+
+    def read_command_spec_hash(
+        self, execution_key: ExecutionKey
+    ) -> Optional[CommandSpecHash]:
+        """Observe an optional immutable command binding for one registered key."""
+        connection = self._require_usable_connection()
+        self._validate_execution_key(execution_key)
+        try:
+            connection.execute("BEGIN")
+            self._validate_store(connection)
+
+            registered = connection.execute(
+                "SELECT execution_key, typeof(execution_key) "
+                "FROM execution_keys WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if registered is None:
+                raise ExecutionKeyNotRegisteredError(
+                    "CommandSpecHash read requires a registered ExecutionKey"
+                )
+            persisted_key = self._validate_persisted_execution_key(
+                registered[0], registered[1]
+            )
+            if persisted_key != execution_key:
+                raise AuthorityStoreMalformedError(
+                    "ExecutionKey lookup violated exact identity semantics"
+                )
+
+            row = connection.execute(
+                "SELECT command_spec_hash, typeof(command_spec_hash) "
+                "FROM execution_command_bindings WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if row is None:
+                command_spec_hash = None
+            else:
+                command_spec_hash = self._validate_persisted_command_spec_hash(
+                    row[0], row[1]
+                )
+
+            connection.execute("COMMIT")
+            return command_spec_hash
+        except AuthorityStoreError:
+            self._rollback_after_failure(connection)
+            raise
+        except sqlite3.DatabaseError as exc:
+            self._rollback_after_failure(connection)
+            raise AuthorityStoreError("CommandSpecHash read failed") from exc
 
     def close(self) -> None:
         connection = self._connection
