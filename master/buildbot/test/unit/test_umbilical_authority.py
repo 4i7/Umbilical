@@ -64,6 +64,23 @@ class AuthorityStoreTests(unittest.TestCase):
             connection.close()
         return path
 
+    def _replace_table_definition_literal(self, table_name, old_literal, new_literal):
+        connection = sqlite3.connect(self.path)
+        try:
+            row = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            table_sql = row[0]
+            self.assertIsInstance(table_sql, str)
+            self.assertEqual(table_sql.count(old_literal), 1)
+            connection.execute(f"DROP TABLE {table_name}")
+            connection.execute(table_sql.replace(old_literal, new_literal, 1))
+            connection.commit()
+        finally:
+            connection.close()
+
     def test_initialize_new_empty_store_succeeds(self):
         with AuthorityStore.initialize_new(self.path) as store:
             self.assertIsNone(store.read_generation("controller/default"))
@@ -87,6 +104,16 @@ class AuthorityStoreTests(unittest.TestCase):
                 objects,
                 [("table", "controller_generations"), ("table", "execution_keys")],
             )
+
+    def test_canonical_v2_schema_round_trip_succeeds(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            self.assertEqual(
+                store.register_execution_key("K"), ExecutionKeyRegistration.NEW
+            )
+        with AuthorityStore.open_existing(self.path) as store:
+            self.assertEqual(store.read_generation("scope"), 1)
+            self.assertTrue(store.execution_key_exists("K"))
 
     def test_initialize_same_store_twice_fails_without_reset(self):
         with AuthorityStore.initialize_new(self.path) as store:
@@ -223,6 +250,31 @@ class AuthorityStoreTests(unittest.TestCase):
             connection.close()
         with self.assertRaises(AuthorityStoreMalformedError):
             AuthorityStore.open_existing(self.path)
+
+    def test_execution_key_literal_case_schema_drift_fails_closed(self):
+        AuthorityStore.initialize_new(self.path).close()
+        self._replace_table_definition_literal("execution_keys", "'text'", "'TEXT'")
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_generation_literal_case_schema_drift_fails_closed(self):
+        AuthorityStore.initialize_new(self.path).close()
+        self._replace_table_definition_literal(
+            "controller_generations", "'text'", "'TEXT'"
+        )
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_noncanonical_v2_schema_blocks_validated_observations(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            self._replace_table_definition_literal(
+                "execution_keys", "'text'", "'TEXT'"
+            )
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.execution_key_exists("missing")
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("scope")
 
     def test_malformed_persisted_generation_fails_closed(self):
         with AuthorityStore.initialize_new(self.path) as store:
@@ -835,6 +887,13 @@ class AuthorityStoreTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_canonical_v1_schema_migration_succeeds(self):
+        self._create_v1_store(rows=(("scope", 5),))
+        AuthorityStore.migrate_v1_to_v2(self.path)
+        with AuthorityStore.open_existing(self.path) as store:
+            self.assertEqual(store.read_generation("scope"), 5)
+            self.assertFalse(store.execution_key_exists("missing"))
+
     def test_explicit_v1_to_v2_migration_preserves_generation_rows(self):
         rows = [("scope/A", 3), ("scope/B", 9)]
         self._create_v1_store(rows=rows)
@@ -858,6 +917,26 @@ class AuthorityStoreTests(unittest.TestCase):
             self.assertEqual(store.acquire_generation("scope/A"), 4)
             self.assertEqual(store.register_execution_key("K"), ExecutionKeyRegistration.NEW)
             self.assertTrue(store.execution_key_exists("K"))
+
+    def test_v1_literal_case_schema_drift_rejects_migration(self):
+        self._create_v1_store()
+        self._replace_table_definition_literal(
+            "controller_generations", "'text'", "'TEXT'"
+        )
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.migrate_v1_to_v2(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (1,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE name = 'execution_keys'"
+                ).fetchall(),
+                [],
+            )
+        finally:
+            connection.close()
 
     def test_malformed_v1_migration_fails_without_resetting_state(self):
         self._create_v1_store(rows=(("scope", 7),))

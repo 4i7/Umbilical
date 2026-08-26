@@ -268,8 +268,15 @@ class AuthorityStore:
             raise AuthorityStoreError("SQLite refused required synchronous=FULL")
 
     @staticmethod
-    def _normalized_sql(sql: str) -> str:
-        return " ".join(sql.lower().split())
+    def _canonical_stored_sql(sql: str) -> str:
+        # SQLite stores Umbilical's canonical CREATE text exactly except for the
+        # single source-formatting newline before CREATE in these DDL constants.
+        # Remove only that known leading character. In particular, do not fold
+        # case or normalize whitespace anywhere inside the stored statement:
+        # quoted SQL literals and CHECK constants are schema semantics.
+        if sql.startswith("\n"):
+            return sql[1:]
+        return sql
 
     @staticmethod
     def _read_schema_version(connection: sqlite3.Connection) -> int:
@@ -346,9 +353,7 @@ class AuthorityStore:
                     raise AuthorityStoreMalformedError(
                         "authority schema does not match the persisted-object allowlist"
                     )
-                if cls._normalized_sql(table_sql) != cls._normalized_sql(
-                    expected_objects[name]
-                ):
+                if table_sql != cls._canonical_stored_sql(expected_objects[name]):
                     raise AuthorityStoreMalformedError(
                         f"{name} definition does not match authority schema"
                     )
