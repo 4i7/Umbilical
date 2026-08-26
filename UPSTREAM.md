@@ -12,3 +12,6 @@ Exact upstream commit:
 
 Import mode:
 full history-preserving Git import
+
+First Umbilical divergence commit:
+7f6118aa4546281e0ebc5b687b65deb1c39e2af2
