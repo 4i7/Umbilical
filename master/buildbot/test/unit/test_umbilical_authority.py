@@ -8,6 +8,7 @@ import concurrent.futures
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -314,6 +315,219 @@ class AuthorityStoreTests(unittest.TestCase):
             # Rollback succeeded, so the same store remains mechanically usable
             # after malformed schema is repaired by an external administrator.
             self.assertEqual(store.acquire_generation("scope"), 2)
+
+    def test_read_revalidates_schema_after_post_open_trigger(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("scope")
+
+    def test_is_current_revalidates_schema_after_post_open_trigger(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.is_current_generation("scope", 1)
+
+    def test_read_failure_rollback_allows_reuse_after_external_repair(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("scope")
+            self.assertFalse(store._poisoned)
+
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute("DROP TRIGGER unexpected_trigger")
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(store.read_generation("scope"), 1)
+
+    def test_read_rollback_failure_permanently_poisons_store(self):
+        store = AuthorityStore.initialize_new(self.path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.acquire_generation("scope"), 1)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER unexpected_trigger
+                AFTER UPDATE ON controller_generations
+                BEGIN
+                    SELECT 1;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        original_connection = store._connection
+        with mock.patch.object(
+            AuthorityStore,
+            "_rollback_transaction",
+            side_effect=sqlite3.OperationalError("injected rollback failure"),
+        ):
+            with self.assertRaises(AuthorityStoreError):
+                store.read_generation("scope")
+
+        self.assertTrue(store._poisoned)
+        self.assertIsNone(store._connection)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            original_connection.execute("SELECT 1")
+        with self.assertRaises(AuthorityStoreError):
+            store.read_generation("scope")
+        with self.assertRaises(AuthorityStoreError):
+            store.is_current_generation("scope", 1)
+        with self.assertRaises(AuthorityStoreError):
+            store.acquire_generation("scope")
+
+    def test_read_valid_store_without_scope_returns_none(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertIsNone(store.read_generation("never-acquired"))
+
+    def test_malformed_store_without_scope_does_not_become_none(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("never-acquired")
+
+    def test_read_commit_failure_returns_no_observation_and_cleans_up(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+            def authorizer(action, argument1, _argument2, _database, _trigger):
+                if action == sqlite3.SQLITE_TRANSACTION and argument1 == "COMMIT":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            store._connection.set_authorizer(authorizer)
+            try:
+                with self.assertRaises(AuthorityStoreError):
+                    store.read_generation("scope")
+            finally:
+                store._connection.set_authorizer(None)
+
+            self.assertFalse(store._connection.in_transaction)
+            self.assertFalse(store._poisoned)
+            self.assertEqual(store.read_generation("scope"), 1)
+
+    def test_read_validation_and_generation_lookup_share_snapshot(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+            validation_complete = threading.Event()
+            writer_complete = threading.Event()
+            original_validate_store = AuthorityStore._validate_store
+            writer_errors = []
+
+            def validate_then_pause(connection):
+                original_validate_store(connection)
+                validation_complete.set()
+                if not writer_complete.wait(timeout=5):
+                    self.fail("concurrent writer did not complete")
+
+            def writer():
+                if not validation_complete.wait(timeout=5):
+                    writer_errors.append(RuntimeError("validation did not complete"))
+                    writer_complete.set()
+                    return
+                connection = sqlite3.connect(self.path, timeout=5.0)
+                try:
+                    connection.execute(
+                        "UPDATE controller_generations SET generation = 2 "
+                        "WHERE scope = 'scope'"
+                    )
+                    connection.commit()
+                except Exception as exc:
+                    writer_errors.append(exc)
+                finally:
+                    connection.close()
+                    writer_complete.set()
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            try:
+                with mock.patch.object(
+                    AuthorityStore,
+                    "_validate_store",
+                    side_effect=validate_then_pause,
+                ):
+                    observed = store.read_generation("scope")
+            finally:
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(writer_errors, [])
+            # The writer committed after validation established the read
+            # snapshot, so this observation may legitimately remain at 1.
+            self.assertEqual(observed, 1)
+            # A subsequent validated observation sees the newly committed state.
+            self.assertEqual(store.read_generation("scope"), 2)
 
     def test_open_existing_rejects_unexpected_persisted_schema_objects(self):
         cases = {

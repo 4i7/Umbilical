@@ -381,23 +381,38 @@ class AuthorityStore:
             raise AuthorityStoreError("generation acquisition failed") from exc
 
     def read_generation(self, scope: AuthorityScope) -> Optional[int]:
-        """Read the persisted current generation, or None if never acquired."""
+        """Observe the persisted generation from one validated SQLite snapshot."""
         connection = self._require_usable_connection()
         self._validate_scope(scope)
         try:
+            # A deferred read transaction is enough here: the first validation
+            # read establishes the WAL snapshot, and full validation plus the
+            # generation lookup then observe that same snapshot. This is an
+            # observation, not a writer-excluding consequential authority fence.
+            connection.execute("BEGIN")
+            self._validate_store(connection)
             row = connection.execute(
                 "SELECT generation, typeof(generation) "
                 "FROM controller_generations WHERE scope = ?",
                 (scope,),
             ).fetchone()
+            if row is None:
+                generation = None
+            else:
+                generation = self._validate_persisted_generation(row[0], row[1])
+            # Do not return observed evidence unless the read transaction has
+            # finished normally. A failed COMMIT enters the common cleanup path.
+            connection.execute("COMMIT")
+            return generation
+        except AuthorityStoreError:
+            self._rollback_after_failure(connection)
+            raise
         except sqlite3.DatabaseError as exc:
+            self._rollback_after_failure(connection)
             raise AuthorityStoreError("generation read failed") from exc
-        if row is None:
-            return None
-        return self._validate_persisted_generation(row[0], row[1])
 
     def is_current_generation(self, scope: AuthorityScope, generation: object) -> bool:
-        """Observe whether *generation* matches persisted current state.
+        """Compare *generation* with a validated durable snapshot observation.
 
         This is not an atomic consequential fence. Future consequential durable
         mutation must combine its expected generation check and mutation in one
