@@ -76,7 +76,8 @@ class AuthorityStore:
 
     def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
         self._path = path
-        self._connection = connection
+        self._connection: Optional[sqlite3.Connection] = connection
+        self._poisoned = False
 
     @classmethod
     def initialize_new(cls, path: PathLike) -> "AuthorityStore":
@@ -200,15 +201,26 @@ class AuthorityStore:
                     f"unsupported authority schema version: {version_row[0]}"
                 )
 
-            table_row = connection.execute(
-                "SELECT type, sql FROM sqlite_master "
-                "WHERE name = 'controller_generations'"
-            ).fetchone()
-            if table_row is None or table_row[0] != "table" or not isinstance(table_row[1], str):
+            schema_rows = connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+            if len(schema_rows) != 1:
                 raise AuthorityStoreMalformedError(
-                    "missing required controller_generations table"
+                    "authority schema contains unexpected persisted objects"
                 )
-            if cls._normalized_sql(table_row[1]) != cls._normalized_sql(
+
+            object_type, name, table_name, table_sql = schema_rows[0]
+            if (
+                object_type != "table"
+                or name != "controller_generations"
+                or table_name != "controller_generations"
+                or not isinstance(table_sql, str)
+            ):
+                raise AuthorityStoreMalformedError(
+                    "authority schema does not match the U1A persisted-object allowlist"
+                )
+            if cls._normalized_sql(table_sql) != cls._normalized_sql(
                 _CREATE_GENERATIONS_SQL
             ):
                 raise AuthorityStoreMalformedError(
@@ -263,18 +275,66 @@ class AuthorityStore:
 
     @staticmethod
     def _rollback_if_needed(connection: sqlite3.Connection) -> None:
+        # Initialization has no reusable AuthorityStore instance to poison.
+        # Best-effort rollback is followed by closing/discarding the connection.
         if connection.in_transaction:
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.DatabaseError:
                 pass
 
+    @staticmethod
+    def _rollback_transaction(connection: sqlite3.Connection) -> None:
+        """Rollback hook kept narrow so rollback failure can be tested deterministically."""
+        connection.execute("ROLLBACK")
+
+    def _require_usable_connection(self) -> sqlite3.Connection:
+        if self._poisoned:
+            raise AuthorityStoreError(
+                "authority store is poisoned after uncertain transaction cleanup"
+            )
+        if self._connection is None:
+            raise AuthorityStoreError("authority store is closed")
+        return self._connection
+
+    def _poison(self) -> None:
+        self._poisoned = True
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.DatabaseError:
+                # The store has already discarded the connection and remains
+                # permanently unusable even if SQLite cannot confirm close.
+                pass
+
+    def _rollback_after_failure(self, connection: sqlite3.Connection) -> None:
+        try:
+            if connection.in_transaction:
+                self._rollback_transaction(connection)
+            if connection.in_transaction:
+                raise sqlite3.OperationalError(
+                    "authority transaction remained active after rollback"
+                )
+        except sqlite3.DatabaseError as exc:
+            self._poison()
+            raise AuthorityStoreError(
+                "authority transaction rollback failed; store permanently poisoned"
+            ) from exc
+
     def acquire_generation(self, scope: AuthorityScope) -> int:
         """Atomically acquire the next durable generation for *scope*."""
+        connection = self._require_usable_connection()
         self._validate_scope(scope)
         try:
-            self._connection.execute("BEGIN IMMEDIATE")
-            row = self._connection.execute(
+            # BEGIN IMMEDIATE serializes ordinary SQLite writers before the
+            # final schema/state validation. No accepted persistent schema
+            # mutation can then interpose before this acquisition commits.
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store(connection)
+
+            row = connection.execute(
                 "SELECT generation, typeof(generation) "
                 "FROM controller_generations WHERE scope = ?",
                 (scope,),
@@ -282,7 +342,7 @@ class AuthorityStore:
 
             if row is None:
                 generation = 1
-                self._connection.execute(
+                connection.execute(
                     "INSERT INTO controller_generations(scope, generation) VALUES (?, ?)",
                     (scope, generation),
                 )
@@ -293,7 +353,7 @@ class AuthorityStore:
                         "ControllerGeneration exhausted SQLite INTEGER range"
                     )
                 generation = current + 1
-                cursor = self._connection.execute(
+                cursor = connection.execute(
                     "UPDATE controller_generations SET generation = ? "
                     "WHERE scope = ? AND generation = ?",
                     (generation, scope, current),
@@ -303,20 +363,21 @@ class AuthorityStore:
                         "generation update did not affect exactly one authority row"
                     )
 
-            self._connection.execute("COMMIT")
+            connection.execute("COMMIT")
             return generation
         except AuthorityStoreError:
-            self._rollback_if_needed(self._connection)
+            self._rollback_after_failure(connection)
             raise
         except sqlite3.DatabaseError as exc:
-            self._rollback_if_needed(self._connection)
+            self._rollback_after_failure(connection)
             raise AuthorityStoreError("generation acquisition failed") from exc
 
     def read_generation(self, scope: AuthorityScope) -> Optional[int]:
         """Read the persisted current generation, or None if never acquired."""
+        connection = self._require_usable_connection()
         self._validate_scope(scope)
         try:
-            row = self._connection.execute(
+            row = connection.execute(
                 "SELECT generation, typeof(generation) "
                 "FROM controller_generations WHERE scope = ?",
                 (scope,),
@@ -328,7 +389,13 @@ class AuthorityStore:
         return self._validate_persisted_generation(row[0], row[1])
 
     def is_current_generation(self, scope: AuthorityScope, generation: object) -> bool:
-        """Return whether *generation* exactly matches persisted current state."""
+        """Observe whether *generation* matches persisted current state.
+
+        This is not an atomic consequential fence. Future consequential durable
+        mutation must combine its expected generation check and mutation in one
+        transaction/CAS-equivalent authority boundary.
+        """
+        self._require_usable_connection()
         self._validate_scope(scope)
         if type(generation) is not int or generation <= 0:
             return False
@@ -336,7 +403,10 @@ class AuthorityStore:
         return current is not None and current == generation
 
     def close(self) -> None:
-        self._connection.close()
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            connection.close()
 
     def __enter__(self) -> "AuthorityStore":
         return self
