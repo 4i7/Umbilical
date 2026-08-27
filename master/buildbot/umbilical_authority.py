@@ -256,6 +256,10 @@ class AuthorityStore:
     def initialize_new(cls, path: PathLike) -> "AuthorityStore":
         """Create a new exact current-schema authority store, failing if it exists."""
         store_path = cls._normalize_path(path)
+        if os.path.lexists(store_path):
+            raise AuthorityStoreExistsError(
+                f"authority store already exists: {store_path}"
+            )
         try:
             fd = os.open(store_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         except FileExistsError as exc:

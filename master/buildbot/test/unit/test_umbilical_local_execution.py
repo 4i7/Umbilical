@@ -390,6 +390,29 @@ class U1FLocalExecutionTests(unittest.TestCase):
         with self.assertRaises(ExecutionLaunchAlreadyClaimedError):
             store.claim_execution_launch("K", "S", generation, command_hash)
 
+    def test_timeout_remains_unknown_and_no_retry(self):
+        store, generation, spec, command_hash = self._prepare()
+        self.addCleanup(store.close)
+        recorder = RecordingLauncher(
+            store,
+            error=local_execution.subprocess.TimeoutExpired(
+                spec.argv, spec.timeout_seconds
+            ),
+        )
+        with self._patched_launcher(recorder):
+            with self.assertRaises(local_execution.subprocess.TimeoutExpired):
+                execute_local_command(
+                    store,
+                    execution_key="K",
+                    authority_scope="S",
+                    controller_generation=generation,
+                    command_spec=spec,
+                )
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertEqual(store.read_execution_launch("K").state, ExecutionLaunchState.UNKNOWN)
+        with self.assertRaises(ExecutionLaunchAlreadyClaimedError):
+            store.claim_execution_launch("K", "S", generation, command_hash)
+
     def test_post_launch_durable_failure_remains_unknown_and_no_retry(self):
         store, generation, spec, command_hash = self._prepare()
         self.addCleanup(store.close)

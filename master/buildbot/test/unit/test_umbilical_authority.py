@@ -84,6 +84,14 @@ class AuthorityStoreTests(unittest.TestCase):
     def _new_path(self, name):
         return Path(self._temporary_directory.name) / name
 
+    @staticmethod
+    def _read_rows(path, query):
+        connection = sqlite3.connect(path)
+        try:
+            return connection.execute(query).fetchall()
+        finally:
+            connection.close()
+
     def _create_v1_store(self, path=None, rows=()):
         path = self.path if path is None else path
         connection = sqlite3.connect(path, isolation_level=None)
@@ -232,7 +240,7 @@ class AuthorityStoreTests(unittest.TestCase):
         self._create_v1_store(rows=(("scope", 7),))
         with self.assertRaises(AuthorityStoreMigrationRequiredError):
             AuthorityStore.open_existing(self.path)
-        self.assertEqual(sqlite3.connect(self.path).execute("PRAGMA user_version").fetchone(), (1,))
+        self.assertEqual(self._read_rows(self.path, "PRAGMA user_version"), [(1,)])
 
     def test_valid_v2_requires_explicit_migration_without_mutation(self):
         self._create_v2_store(generation_rows=(("scope", 7),), execution_keys=("K",))
@@ -285,15 +293,15 @@ class AuthorityStoreTests(unittest.TestCase):
     def test_v2_to_v3_preserves_execution_keys_exactly(self):
         keys = [" K ", "K", "k", "é", "é"]
         self._create_v2_store(execution_keys=keys)
-        before = sqlite3.connect(self.path).execute("SELECT execution_key FROM execution_keys ORDER BY execution_key").fetchall()
+        before = self._read_rows(self.path, "SELECT execution_key FROM execution_keys ORDER BY execution_key")
         AuthorityStore.migrate_v2_to_v3(self.path)
-        after = sqlite3.connect(self.path).execute("SELECT execution_key FROM execution_keys ORDER BY execution_key").fetchall()
+        after = self._read_rows(self.path, "SELECT execution_key FROM execution_keys ORDER BY execution_key")
         self.assertEqual(after, before)
 
     def test_v2_to_v3_invents_zero_bindings(self):
         self._create_v2_store(execution_keys=("K1", "K2"))
         AuthorityStore.migrate_v2_to_v3(self.path)
-        self.assertEqual(sqlite3.connect(self.path).execute("SELECT * FROM execution_command_bindings").fetchall(), [])
+        self.assertEqual(self._read_rows(self.path, "SELECT * FROM execution_command_bindings"), [])
 
     def test_malformed_v2_migration_fails_closed(self):
         self._create_v2_store(execution_keys=("K",))
@@ -319,7 +327,7 @@ class AuthorityStoreTests(unittest.TestCase):
         self._create_v2_store(execution_keys=("K",))
         with self.assertRaises(AuthorityStoreVersionError):
             AuthorityStore.migrate_v1_to_v2(self.path)
-        self.assertEqual(sqlite3.connect(self.path).execute("PRAGMA user_version").fetchone(), (2,))
+        self.assertEqual(self._read_rows(self.path, "PRAGMA user_version"), [(2,)])
 
     def test_first_acquisition_returns_one(self):
         with AuthorityStore.initialize_new(self.path) as store:
@@ -1312,19 +1320,32 @@ class AuthorityStoreTests(unittest.TestCase):
 
     def test_v3_to_v4_preserves_generation_rows_exactly(self):
         rows=[("A",3),("B",9)]; self._create_v3_store(generation_rows=rows)
-        before=sqlite3.connect(self.path).execute("SELECT * FROM controller_generations ORDER BY scope").fetchall(); AuthorityStore.migrate_v3_to_v4(self.path); after=sqlite3.connect(self.path).execute("SELECT * FROM controller_generations ORDER BY scope").fetchall(); self.assertEqual(after,before)
+        before = self._read_rows(self.path, "SELECT * FROM controller_generations ORDER BY scope")
+        AuthorityStore.migrate_v3_to_v4(self.path)
+        after = self._read_rows(self.path, "SELECT * FROM controller_generations ORDER BY scope")
+        self.assertEqual(after, before)
 
     def test_v3_to_v4_preserves_execution_keys_exactly(self):
         keys=(" K ","K","k","é","é"); self._create_v3_store(execution_keys=keys)
-        before=sqlite3.connect(self.path).execute("SELECT * FROM execution_keys ORDER BY execution_key").fetchall(); AuthorityStore.migrate_v3_to_v4(self.path); after=sqlite3.connect(self.path).execute("SELECT * FROM execution_keys ORDER BY execution_key").fetchall(); self.assertEqual(after,before)
+        before = self._read_rows(self.path, "SELECT * FROM execution_keys ORDER BY execution_key")
+        AuthorityStore.migrate_v3_to_v4(self.path)
+        after = self._read_rows(self.path, "SELECT * FROM execution_keys ORDER BY execution_key")
+        self.assertEqual(after, before)
 
     def test_v3_to_v4_preserves_command_bindings_exactly(self):
         self._create_v3_store(execution_keys=("K1","K2"),bindings=(("K1","H1"),("K2","H2")))
-        before=sqlite3.connect(self.path).execute("SELECT * FROM execution_command_bindings ORDER BY execution_key").fetchall(); AuthorityStore.migrate_v3_to_v4(self.path); after=sqlite3.connect(self.path).execute("SELECT * FROM execution_command_bindings ORDER BY execution_key").fetchall(); self.assertEqual(after,before)
+        before = self._read_rows(
+            self.path, "SELECT * FROM execution_command_bindings ORDER BY execution_key"
+        )
+        AuthorityStore.migrate_v3_to_v4(self.path)
+        after = self._read_rows(
+            self.path, "SELECT * FROM execution_command_bindings ORDER BY execution_key"
+        )
+        self.assertEqual(after, before)
 
     def test_v3_to_v4_invents_zero_admissions(self):
         self._create_v3_store(execution_keys=("K",),bindings=(("K","H"),)); AuthorityStore.migrate_v3_to_v4(self.path)
-        self.assertEqual(sqlite3.connect(self.path).execute("SELECT * FROM execution_admissions").fetchall(),[])
+        self.assertEqual(self._read_rows(self.path, "SELECT * FROM execution_admissions"), [])
 
     def test_malformed_v3_rejects_migration(self):
         self._create_v3_store(execution_keys=("K",),bindings=(("K","H"),)); self._replace_table_definition_literal("execution_command_bindings","'text' AND command_spec_hash","'TEXT' AND command_spec_hash")
@@ -1458,7 +1479,9 @@ class AuthorityStoreTests(unittest.TestCase):
             except ExecutionAdmissionConflictError: return "conflict"
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool: results=list(pool.map(admit,(("S1",g1),("S2",g2))))
         self.assertEqual(results.count(ExecutionAdmissionResult.ADMITTED),1); self.assertEqual(results.count("conflict"),1)
-        self.assertEqual(sqlite3.connect(self.path).execute("SELECT count(*) FROM execution_admissions").fetchone(),(1,))
+        self.assertEqual(
+            self._read_rows(self.path, "SELECT count(*) FROM execution_admissions"), [(1,)]
+        )
 
     def test_generation_advance_admission_race_only_serialized_outcomes(self):
         for index in range(8):
