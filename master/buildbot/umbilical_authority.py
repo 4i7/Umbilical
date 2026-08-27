@@ -22,6 +22,7 @@ import sqlite3
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 from typing import Optional
 from typing import Union
 
@@ -38,6 +39,19 @@ _SCHEMA_VERSION = 5
 _MAX_GENERATION = (1 << 63) - 1
 _MIN_SQLITE_INTEGER = -(1 << 63)
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
+
+
+class _AuthorityStorePathReservation:
+    """Own the one handle that reserves an authority-store path."""
+
+    def __init__(self, close: Callable[[], None]) -> None:
+        self._close: Optional[Callable[[], None]] = close
+
+    def close(self) -> None:
+        close = self._close
+        if close is not None:
+            self._close = None
+            close()
 
 _CREATE_GENERATIONS_SQL = """
 CREATE TABLE controller_generations (
@@ -256,12 +270,8 @@ class AuthorityStore:
     def initialize_new(cls, path: PathLike) -> "AuthorityStore":
         """Create a new exact current-schema authority store, failing if it exists."""
         store_path = cls._normalize_path(path)
-        if os.path.lexists(store_path):
-            raise AuthorityStoreExistsError(
-                f"authority store already exists: {store_path}"
-            )
         try:
-            fd = os.open(store_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            reservation = cls._reserve_new_path(store_path)
         except FileExistsError as exc:
             raise AuthorityStoreExistsError(
                 f"authority store already exists: {store_path}"
@@ -270,12 +280,13 @@ class AuthorityStore:
             raise AuthorityStoreError(
                 f"unable to reserve new authority store: {store_path}"
             ) from exc
-        else:
-            os.close(fd)
 
         connection: Optional[sqlite3.Connection] = None
         try:
-            connection = cls._connect_rw(store_path)
+            try:
+                connection = cls._connect_rw(store_path)
+            finally:
+                reservation.close()
             cls._configure_durability(connection)
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(_CREATE_GENERATIONS_SQL)
@@ -292,7 +303,7 @@ class AuthorityStore:
                 cls._rollback_if_needed(connection)
                 connection.close()
             raise
-        except sqlite3.DatabaseError as exc:
+        except (OSError, sqlite3.DatabaseError) as exc:
             if connection is not None:
                 cls._rollback_if_needed(connection)
                 connection.close()
@@ -449,10 +460,61 @@ class AuthorityStore:
 
     @staticmethod
     def _normalize_path(path: PathLike) -> Path:
-        # Do not resolve symlinks. O_CREAT|O_EXCL must observe an existing
-        # symlink itself (including a broken one) rather than following it.
+        # Do not resolve symlinks: final-component safety belongs to reservation.
         expanded = os.path.expanduser(os.fspath(path))
         return Path(os.path.abspath(expanded))
+
+    @staticmethod
+    def _reserve_new_path(path: Path) -> _AuthorityStorePathReservation:
+        if os.name == "nt":
+            return AuthorityStore._reserve_new_windows_path(path)
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        return _AuthorityStorePathReservation(lambda: os.close(fd))
+
+    @staticmethod
+    def _reserve_new_windows_path(path: Path) -> _AuthorityStorePathReservation:
+        import ctypes
+        from ctypes import wintypes
+
+        create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0xC0000000,  # GENERIC_READ | GENERIC_WRITE
+            0x00000003,  # FILE_SHARE_READ | FILE_SHARE_WRITE; never FILE_SHARE_DELETE
+            None,
+            1,  # CREATE_NEW
+            0x00200080,  # FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            error = ctypes.get_last_error()
+            if error in (80, 183):  # ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS
+                raise FileExistsError(error, os.strerror(error), str(path))
+            raise OSError(error, os.strerror(error), str(path))
+
+        close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        def close() -> None:
+            if not close_handle(handle):
+                error = ctypes.get_last_error()
+                raise OSError(error, os.strerror(error), str(path))
+
+        return _AuthorityStorePathReservation(close)
 
     @staticmethod
     def _connect_rw(path: Path) -> sqlite3.Connection:

@@ -231,6 +231,41 @@ class AuthorityStoreTests(unittest.TestCase):
             AuthorityStore.initialize_new(link)
         self.assertFalse(target.exists())
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_initialize_rejects_symlink_interposed_at_reservation(self):
+        target = self._new_path("interposed-target.sqlite3")
+        real_reserve = AuthorityStore._reserve_new_path
+
+        def interpose(path):
+            try:
+                os.symlink(target, path)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation unavailable")
+            return real_reserve(path)
+
+        with mock.patch.object(AuthorityStore, "_reserve_new_path", side_effect=interpose):
+            with self.assertRaises(AuthorityStoreExistsError):
+                AuthorityStore.initialize_new(self.path)
+        self.assertTrue(os.path.lexists(self.path))
+        self.assertFalse(target.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows reservation semantics required")
+    def test_windows_reservation_prevents_replacement_before_sqlite_open(self):
+        replacement = self._new_path("replacement.sqlite3")
+        replacement.write_bytes(b"not an authority store")
+        real_connect = AuthorityStore._connect_rw
+
+        def connect(path):
+            with self.assertRaises(PermissionError):
+                os.replace(replacement, path)
+            self.assertTrue(path.exists())
+            return real_connect(path)
+
+        with mock.patch.object(AuthorityStore, "_connect_rw", side_effect=connect):
+            with AuthorityStore.initialize_new(self.path) as store:
+                self.assertIsNone(store.read_generation("controller/default"))
+        self.assertTrue(replacement.exists())
+
     def test_open_existing_missing_path_fails(self):
         with self.assertRaises(AuthorityStoreMissingError):
             AuthorityStore.open_existing(self.path)
