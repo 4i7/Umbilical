@@ -8,6 +8,7 @@ import concurrent.futures
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -922,6 +923,736 @@ class AuthorityStoreTests(unittest.TestCase):
             connection.close()
         with self.assertRaises(AuthorityStoreVersionError):
             AuthorityStore.open_existing(self.path)
+
+    def test_canonical_v2_schema_round_trip_succeeds(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            self.assertEqual(
+                store.register_execution_key("K"), ExecutionKeyRegistration.NEW
+            )
+        with AuthorityStore.open_existing(self.path) as store:
+            self.assertEqual(store.read_generation("scope"), 1)
+            self.assertTrue(store.execution_key_exists("K"))
+
+    def test_is_current_generation_requires_exact_persisted_generation(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            current = store.acquire_generation("scope")
+            self.assertTrue(store.is_current_generation("scope", current))
+            self.assertFalse(store.is_current_generation("scope", 0))
+            self.assertFalse(store.is_current_generation("scope", True))
+            self.assertFalse(store.is_current_generation("scope", current + 1))
+            self.assertFalse(store.is_current_generation("never-acquired", 1))
+
+    def test_prior_generation_becomes_stale_after_next_acquisition(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            old_generation = store.acquire_generation("scope")
+            new_generation = store.acquire_generation("scope")
+            self.assertEqual(new_generation, old_generation + 1)
+            self.assertFalse(store.is_current_generation("scope", old_generation))
+            self.assertTrue(store.is_current_generation("scope", new_generation))
+
+    def test_missing_required_table_fails_closed(self):
+        AuthorityStore.initialize_new(self.path).close()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DROP TABLE controller_generations")
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_schema_definition_drift_fails_closed(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA user_version = 3")
+            connection.execute(
+                """
+                CREATE TABLE controller_generations (
+                    scope TEXT NOT NULL PRIMARY KEY,
+                    generation INTEGER NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+            connection.execute(_V2_EXECUTION_KEYS_SQL)
+            connection.execute(_V3_BINDINGS_SQL)
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_execution_key_literal_case_schema_drift_fails_closed(self):
+        AuthorityStore.initialize_new(self.path).close()
+        self._replace_table_definition_literal("execution_keys", "'text'", "'TEXT'")
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_generation_literal_case_schema_drift_fails_closed(self):
+        AuthorityStore.initialize_new(self.path).close()
+        self._replace_table_definition_literal(
+            "controller_generations", "'text'", "'TEXT'"
+        )
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_noncanonical_v2_schema_blocks_validated_observations(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            self._replace_table_definition_literal(
+                "execution_keys", "'text'", "'TEXT'"
+            )
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.execution_key_exists("missing")
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("scope")
+
+    def test_malformed_persisted_generation_fails_closed(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("controller/default"), 1)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "UPDATE controller_generations SET generation = 0 "
+                "WHERE scope = 'controller/default'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_unwritable_connection_acquisition_fails_closed(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            store._connection.execute("PRAGMA query_only = ON")
+            with self.assertRaises(AuthorityStoreError):
+                store.acquire_generation("scope")
+            store._connection.execute("PRAGMA query_only = OFF")
+            self.assertIsNone(store.read_generation("scope"))
+
+    def test_open_existing_rejects_persistent_after_update_trigger(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER rewind_generation
+                AFTER UPDATE OF generation ON controller_generations
+                BEGIN
+                    UPDATE controller_generations
+                    SET generation = OLD.generation
+                    WHERE scope = NEW.scope;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_open_existing_rejects_persistent_insert_trigger(self):
+        AuthorityStore.initialize_new(self.path).close()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER rewrite_insert_generation
+                AFTER INSERT ON controller_generations
+                BEGIN
+                    UPDATE controller_generations
+                    SET generation = NEW.generation + 100
+                    WHERE scope = NEW.scope;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_acquire_revalidates_schema_after_post_open_mutation(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER rewind_generation
+                    AFTER UPDATE OF generation ON controller_generations
+                    BEGIN
+                        UPDATE controller_generations
+                        SET generation = OLD.generation
+                        WHERE scope = NEW.scope;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.acquire_generation("scope")
+
+            connection = sqlite3.connect(self.path)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT generation FROM controller_generations WHERE scope = 'scope'"
+                    ).fetchone(),
+                    (1,),
+                )
+                connection.execute("DROP TRIGGER rewind_generation")
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(store.acquire_generation("scope"), 2)
+
+    def test_read_revalidates_schema_after_post_open_trigger(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("scope")
+
+    def test_is_current_revalidates_schema_after_post_open_trigger(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.is_current_generation("scope", 1)
+
+    def test_read_failure_rollback_allows_reuse_after_external_repair(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("scope")
+            self.assertFalse(store._poisoned)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute("DROP TRIGGER unexpected_trigger")
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(store.read_generation("scope"), 1)
+
+    def test_read_rollback_failure_permanently_poisons_store(self):
+        store = AuthorityStore.initialize_new(self.path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.acquire_generation("scope"), 1)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER unexpected_trigger
+                AFTER UPDATE ON controller_generations
+                BEGIN
+                    SELECT 1;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        original_connection = store._connection
+        with mock.patch.object(
+            AuthorityStore,
+            "_rollback_transaction",
+            side_effect=sqlite3.OperationalError("injected rollback failure"),
+        ):
+            with self.assertRaises(AuthorityStoreError):
+                store.read_generation("scope")
+
+        self.assertTrue(store._poisoned)
+        self.assertIsNone(store._connection)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            original_connection.execute("SELECT 1")
+        with self.assertRaises(AuthorityStoreError):
+            store.read_generation("scope")
+        with self.assertRaises(AuthorityStoreError):
+            store.is_current_generation("scope", 1)
+        with self.assertRaises(AuthorityStoreError):
+            store.acquire_generation("scope")
+
+    def test_read_valid_store_without_scope_returns_none(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertIsNone(store.read_generation("never-acquired"))
+
+    def test_malformed_store_without_scope_does_not_become_none(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TRIGGER unexpected_trigger
+                    AFTER UPDATE ON controller_generations
+                    BEGIN
+                        SELECT 1;
+                    END
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.read_generation("never-acquired")
+
+    def test_read_commit_failure_returns_no_observation_and_cleans_up(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+
+            def authorizer(action, argument1, _argument2, _database, _trigger):
+                if action == sqlite3.SQLITE_TRANSACTION and argument1 == "COMMIT":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            store._connection.set_authorizer(authorizer)
+            try:
+                with self.assertRaises(AuthorityStoreError):
+                    store.read_generation("scope")
+            finally:
+                store._connection.set_authorizer(None)
+
+            self.assertFalse(store._connection.in_transaction)
+            self.assertFalse(store._poisoned)
+            self.assertEqual(store.read_generation("scope"), 1)
+
+    def test_read_validation_and_generation_lookup_share_snapshot(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.acquire_generation("scope"), 1)
+            validation_complete = threading.Event()
+            writer_complete = threading.Event()
+            original_validate_store = AuthorityStore._validate_store
+            writer_errors = []
+
+            def validate_then_pause(connection):
+                original_validate_store(connection)
+                validation_complete.set()
+                if not writer_complete.wait(timeout=5):
+                    self.fail("concurrent writer did not complete")
+
+            def writer():
+                if not validation_complete.wait(timeout=5):
+                    writer_errors.append(RuntimeError("validation did not complete"))
+                    writer_complete.set()
+                    return
+                connection = sqlite3.connect(self.path, timeout=5.0)
+                try:
+                    connection.execute(
+                        "UPDATE controller_generations SET generation = 2 WHERE scope = 'scope'"
+                    )
+                    connection.commit()
+                except Exception as exc:
+                    writer_errors.append(exc)
+                finally:
+                    connection.close()
+                    writer_complete.set()
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            try:
+                with mock.patch.object(
+                    AuthorityStore, "_validate_store", side_effect=validate_then_pause
+                ):
+                    observed = store.read_generation("scope")
+            finally:
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(writer_errors, [])
+            self.assertEqual(observed, 1)
+            self.assertEqual(store.read_generation("scope"), 2)
+
+    def test_open_existing_rejects_unexpected_persisted_schema_objects(self):
+        cases = {
+            "table": "CREATE TABLE unexpected_table(value INTEGER)",
+            "view": (
+                "CREATE VIEW unexpected_view AS "
+                "SELECT scope, generation FROM controller_generations"
+            ),
+            "index": "CREATE INDEX unexpected_index ON controller_generations(generation)",
+            "sqlite-lookalike-trigger": (
+                "CREATE TRIGGER sqliteXrewind "
+                "AFTER UPDATE OF generation ON controller_generations "
+                "BEGIN UPDATE controller_generations "
+                "SET generation = OLD.generation WHERE scope = NEW.scope; END"
+            ),
+        }
+        for kind, ddl in cases.items():
+            with self.subTest(kind=kind):
+                path = Path(self._temporary_directory.name) / f"unexpected-{kind}.sqlite3"
+                AuthorityStore.initialize_new(path).close()
+                connection = sqlite3.connect(path)
+                try:
+                    connection.execute(ddl)
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(AuthorityStoreMalformedError):
+                    AuthorityStore.open_existing(path)
+
+    def test_rollback_failure_permanently_poisons_store(self):
+        store = AuthorityStore.initialize_new(self.path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.acquire_generation("scope"), 1)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER unexpected_trigger
+                AFTER UPDATE ON controller_generations
+                BEGIN
+                    SELECT 1;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        original_connection = store._connection
+        with mock.patch.object(
+            AuthorityStore,
+            "_rollback_transaction",
+            side_effect=sqlite3.OperationalError("injected rollback failure"),
+        ):
+            with self.assertRaises(AuthorityStoreError):
+                store.acquire_generation("scope")
+
+        self.assertTrue(store._poisoned)
+        self.assertIsNone(store._connection)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            original_connection.execute("SELECT 1")
+        with self.assertRaises(AuthorityStoreError):
+            store.read_generation("scope")
+        with self.assertRaises(AuthorityStoreError):
+            store.is_current_generation("scope", 1)
+        with self.assertRaises(AuthorityStoreError):
+            store.acquire_generation("scope")
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT generation FROM controller_generations WHERE scope = 'scope'"
+                ).fetchone(),
+                (1,),
+            )
+        finally:
+            connection.close()
+
+    def test_independent_execution_keys_register_independently(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.register_execution_key("K1"), ExecutionKeyRegistration.NEW)
+            self.assertEqual(store.register_execution_key("K2"), ExecutionKeyRegistration.NEW)
+            self.assertTrue(store.execution_key_exists("K1"))
+            self.assertTrue(store.execution_key_exists("K2"))
+
+    def test_execution_key_is_exact_and_not_normalized(self):
+        keys = ["K", "k", " K ", " "]
+        with AuthorityStore.initialize_new(self.path) as store:
+            for key in keys:
+                self.assertEqual(store.register_execution_key(key), ExecutionKeyRegistration.NEW)
+            self.assertEqual(
+                store._connection.execute(
+                    "SELECT execution_key FROM execution_keys ORDER BY execution_key"
+                ).fetchall(),
+                [(" ",), (" K ",), ("K",), ("k",)],
+            )
+
+    def test_execution_key_restart_preserves_registration(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.register_execution_key("K"), ExecutionKeyRegistration.NEW)
+        with AuthorityStore.open_existing(self.path) as store:
+            self.assertTrue(store.execution_key_exists("K"))
+            self.assertEqual(
+                store.register_execution_key("K"), ExecutionKeyRegistration.DUPLICATE
+            )
+
+    def test_malformed_persisted_execution_key_fails_closed(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.register_execution_key("K"), ExecutionKeyRegistration.NEW)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute("UPDATE execution_keys SET execution_key = '' WHERE execution_key = 'K'")
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.open_existing(self.path)
+
+    def test_registration_revalidates_schema_after_post_open_mutation(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute("CREATE TABLE unexpected_table(value INTEGER)")
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.register_execution_key("K")
+            connection = sqlite3.connect(self.path)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT count(*) FROM execution_keys").fetchone(), (0,)
+                )
+            finally:
+                connection.close()
+
+    def test_execution_key_exists_revalidates_schema_after_post_open_mutation(self):
+        with AuthorityStore.initialize_new(self.path) as store:
+            self.assertEqual(store.register_execution_key("K"), ExecutionKeyRegistration.NEW)
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute("CREATE VIEW unexpected_view AS SELECT execution_key FROM execution_keys")
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaises(AuthorityStoreMalformedError):
+                store.execution_key_exists("missing")
+
+    def test_registration_rollback_failure_permanently_poisons_store(self):
+        store = AuthorityStore.initialize_new(self.path)
+        self.addCleanup(store.close)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("CREATE TABLE unexpected_table(value INTEGER)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        original_connection = store._connection
+        with mock.patch.object(
+            AuthorityStore,
+            "_rollback_transaction",
+            side_effect=sqlite3.OperationalError("injected rollback failure"),
+        ):
+            with self.assertRaises(AuthorityStoreError):
+                store.register_execution_key("K")
+
+        self.assertTrue(store._poisoned)
+        self.assertIsNone(store._connection)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            original_connection.execute("SELECT 1")
+        for operation in (
+            lambda: store.register_execution_key("K"),
+            lambda: store.execution_key_exists("K"),
+            lambda: store.acquire_generation("scope"),
+            lambda: store.read_generation("scope"),
+        ):
+            with self.assertRaises(AuthorityStoreError):
+                operation()
+
+    def test_exact_v1_store_does_not_silently_open_as_v2(self):
+        self._create_v1_store(rows=(("scope", 7),))
+        with self.assertRaises(AuthorityStoreMigrationRequiredError):
+            AuthorityStore.open_existing(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (1,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT scope, generation FROM controller_generations"
+                ).fetchall(),
+                [("scope", 7)],
+            )
+        finally:
+            connection.close()
+
+    def test_canonical_v1_schema_migration_succeeds(self):
+        self._create_v1_store(rows=(("scope", 5),))
+        AuthorityStore.migrate_v1_to_v2(self.path)
+        AuthorityStore.migrate_v2_to_v3(self.path)
+        with AuthorityStore.open_existing(self.path) as store:
+            self.assertEqual(store.read_generation("scope"), 5)
+            self.assertFalse(store.execution_key_exists("missing"))
+
+    def test_explicit_v1_to_v2_migration_preserves_generation_rows(self):
+        rows = [("scope/A", 3), ("scope/B", 9)]
+        self._create_v1_store(rows=rows)
+        before = sqlite3.connect(self.path)
+        try:
+            before_rows = before.execute(
+                "SELECT scope, generation FROM controller_generations ORDER BY scope"
+            ).fetchall()
+        finally:
+            before.close()
+
+        AuthorityStore.migrate_v1_to_v2(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            after_rows = connection.execute(
+                "SELECT scope, generation FROM controller_generations ORDER BY scope"
+            ).fetchall()
+            self.assertEqual(after_rows, before_rows)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (2,))
+        finally:
+            connection.close()
+
+        AuthorityStore.migrate_v2_to_v3(self.path)
+        with AuthorityStore.open_existing(self.path) as store:
+            self.assertEqual(store.read_generation("scope/A"), 3)
+            self.assertEqual(store.acquire_generation("scope/A"), 4)
+            self.assertEqual(store.register_execution_key("K"), ExecutionKeyRegistration.NEW)
+            self.assertTrue(store.execution_key_exists("K"))
+
+    def test_v1_literal_case_schema_drift_rejects_migration(self):
+        self._create_v1_store()
+        self._replace_table_definition_literal(
+            "controller_generations", "'text'", "'TEXT'"
+        )
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.migrate_v1_to_v2(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (1,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE name = 'execution_keys'"
+                ).fetchall(),
+                [],
+            )
+        finally:
+            connection.close()
+
+    def test_malformed_v1_migration_fails_without_resetting_state(self):
+        self._create_v1_store(rows=(("scope", 7),))
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("CREATE TABLE unexpected_table(value INTEGER)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.migrate_v1_to_v2(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (1,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT scope, generation FROM controller_generations"
+                ).fetchall(),
+                [("scope", 7)],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE name = 'execution_keys'"
+                ).fetchall(),
+                [],
+            )
+        finally:
+            connection.close()
+
+    def test_v1_to_v2_migration_called_on_v2_fails(self):
+        self._create_v2_store(execution_keys=("K",))
+        with self.assertRaises(AuthorityStoreVersionError):
+            AuthorityStore.migrate_v1_to_v2(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (2,))
+            self.assertEqual(
+                connection.execute("SELECT execution_key FROM execution_keys").fetchall(),
+                [("K",)],
+            )
+        finally:
+            connection.close()
+
+    def test_v1_to_v2_migration_rejects_unsupported_version(self):
+        self._create_v1_store()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA user_version = 999")
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreVersionError):
+            AuthorityStore.migrate_v1_to_v2(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (999,))
+        finally:
+            connection.close()
+
+    def test_v1_to_v2_migration_rejects_unexpected_v1_schema_object(self):
+        self._create_v1_store(rows=(("scope", 2),))
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER unexpected_trigger
+                AFTER UPDATE ON controller_generations
+                BEGIN
+                    SELECT 1;
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMalformedError):
+            AuthorityStore.migrate_v1_to_v2(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (1,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT generation FROM controller_generations WHERE scope = 'scope'"
+                ).fetchone(),
+                (2,),
+            )
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":
