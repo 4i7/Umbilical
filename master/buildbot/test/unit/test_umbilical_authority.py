@@ -190,6 +190,12 @@ class AuthorityStoreTests(unittest.TestCase):
             self.assertEqual(store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
             self.assertEqual(store._connection.execute("PRAGMA synchronous").fetchone(), (2,))
 
+    def test_initialize_new_rejects_non_windows_without_creating_a_store(self):
+        with mock.patch.object(authority.os, "name", "posix"):
+            with self.assertRaisesRegex(AuthorityStoreError, "supported only on Windows"):
+                AuthorityStore.initialize_new(self.path)
+        self.assertFalse(self.path.exists())
+
     def test_initialize_new_creates_exact_v5_schema_directly(self):
         with AuthorityStore.initialize_new(self.path) as store:
             self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone(), (5,))
@@ -234,7 +240,7 @@ class AuthorityStoreTests(unittest.TestCase):
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
     def test_initialize_rejects_symlink_interposed_at_reservation(self):
         target = self._new_path("interposed-target.sqlite3")
-        real_reserve = AuthorityStore._reserve_new_path
+        real_reserve = AuthorityStore._reserve_new_windows_path
 
         def interpose(path):
             try:
@@ -243,7 +249,7 @@ class AuthorityStoreTests(unittest.TestCase):
                 self.skipTest("symlink creation unavailable")
             return real_reserve(path)
 
-        with mock.patch.object(AuthorityStore, "_reserve_new_path", side_effect=interpose):
+        with mock.patch.object(AuthorityStore, "_reserve_new_windows_path", side_effect=interpose):
             with self.assertRaises(AuthorityStoreExistsError):
                 AuthorityStore.initialize_new(self.path)
         self.assertTrue(os.path.lexists(self.path))

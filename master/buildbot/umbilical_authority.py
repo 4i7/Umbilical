@@ -269,9 +269,11 @@ class AuthorityStore:
     @classmethod
     def initialize_new(cls, path: PathLike) -> "AuthorityStore":
         """Create a new exact current-schema authority store, failing if it exists."""
+        if os.name != "nt":
+            raise AuthorityStoreError("new authority-store initialization is supported only on Windows")
         store_path = cls._normalize_path(path)
         try:
-            reservation = cls._reserve_new_path(store_path)
+            reservation = cls._reserve_new_windows_path(store_path)
         except FileExistsError as exc:
             raise AuthorityStoreExistsError(
                 f"authority store already exists: {store_path}"
@@ -463,16 +465,6 @@ class AuthorityStore:
         # Do not resolve symlinks: final-component safety belongs to reservation.
         expanded = os.path.expanduser(os.fspath(path))
         return Path(os.path.abspath(expanded))
-
-    @staticmethod
-    def _reserve_new_path(path: Path) -> _AuthorityStorePathReservation:
-        if os.name == "nt":
-            return AuthorityStore._reserve_new_windows_path(path)
-        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags, 0o600)
-        return _AuthorityStorePathReservation(lambda: os.close(fd))
 
     @staticmethod
     def _reserve_new_windows_path(path: Path) -> _AuthorityStorePathReservation:
