@@ -175,23 +175,24 @@ class AuthorityStoreTests(unittest.TestCase):
             return sqlite3.SQLITE_OK
         store._connection.set_authorizer(authorizer)
 
-    # U1A/U1B/U1D regression preservation, mechanically adapted to current v4.
+    # U1A/U1B/U1D regression preservation, mechanically adapted to current v5.
     def test_initialize_new_empty_store_succeeds(self):
         with AuthorityStore.initialize_new(self.path) as store:
             self.assertIsNone(store.read_generation("controller/default"))
             self.assertEqual(store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
             self.assertEqual(store._connection.execute("PRAGMA synchronous").fetchone(), (2,))
 
-    def test_initialize_new_creates_exact_v4_schema_directly(self):
+    def test_initialize_new_creates_exact_v5_schema_directly(self):
         with AuthorityStore.initialize_new(self.path) as store:
-            self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone(), (4,))
+            self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone(), (5,))
             self.assertEqual(
                 store._connection.execute(
                     "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
                 ).fetchall(),
-                [("table", "controller_generations"), ("table", "execution_admissions"), ("table", "execution_command_bindings"), ("table", "execution_keys")],
+                [("table", "controller_generations"), ("table", "execution_admissions"), ("table", "execution_command_bindings"), ("table", "execution_keys"), ("table", "execution_launches")],
             )
             self.assertEqual(store._connection.execute("SELECT * FROM execution_admissions").fetchall(), [])
+            self.assertEqual(store._connection.execute("SELECT * FROM execution_launches").fetchall(), [])
 
     def test_canonical_persisted_schema_literals_are_exact(self):
         with AuthorityStore.initialize_new(self.path) as store:
@@ -200,6 +201,7 @@ class AuthorityStoreTests(unittest.TestCase):
             self.assertEqual(rows["execution_keys"], _V2_EXECUTION_KEYS_SQL.lstrip("\n"))
             self.assertEqual(rows["execution_command_bindings"], _V3_BINDINGS_SQL.lstrip("\n"))
             self.assertEqual(rows["execution_admissions"], _V4_ADMISSIONS_SQL.lstrip("\n"))
+            self.assertEqual(rows["execution_launches"], authority._CREATE_EXECUTION_LAUNCHES_SQL.lstrip("\n"))
 
     def test_initialize_same_store_twice_fails_without_reset(self):
         with AuthorityStore.initialize_new(self.path) as store:
@@ -263,11 +265,12 @@ class AuthorityStoreTests(unittest.TestCase):
         self.assertEqual(c.execute("PRAGMA user_version").fetchone(), (3,))
         self.assertEqual(c.execute("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name").fetchall(), [("controller_generations",), ("execution_command_bindings",), ("execution_keys",)])
 
-    def test_explicit_v1_to_v2_to_v3_to_v4_chain_succeeds(self):
+    def test_explicit_v1_to_v2_to_v3_to_v4_to_v5_chain_succeeds(self):
         self._create_v1_store(rows=(("scope", 5),))
         AuthorityStore.migrate_v1_to_v2(self.path)
         AuthorityStore.migrate_v2_to_v3(self.path)
         AuthorityStore.migrate_v3_to_v4(self.path)
+        AuthorityStore.migrate_v4_to_v5(self.path)
         with AuthorityStore.open_existing(self.path) as store:
             self.assertEqual(store.read_generation("scope"), 5)
             self.assertFalse(store.execution_key_exists("missing"))
@@ -690,7 +693,7 @@ class AuthorityStoreTests(unittest.TestCase):
             AuthorityStore.open_existing(self.path)
 
     def test_noncanonical_v2_schema_blocks_validated_observations(self):
-        # Historical test name retained; current v4 observations still fail closed
+        # Historical test name retained; current v5 observations still fail closed
         # on the same noncanonical execution_keys definition.
         with AuthorityStore.initialize_new(self.path) as store:
             self.assertEqual(store.acquire_generation("scope"), 1)
@@ -1148,6 +1151,7 @@ class AuthorityStoreTests(unittest.TestCase):
         AuthorityStore.migrate_v1_to_v2(self.path)
         AuthorityStore.migrate_v2_to_v3(self.path)
         AuthorityStore.migrate_v3_to_v4(self.path)
+        AuthorityStore.migrate_v4_to_v5(self.path)
         with AuthorityStore.open_existing(self.path) as store:
             self.assertEqual(store.read_generation("scope"), 5)
             self.assertFalse(store.execution_key_exists("missing"))
@@ -1174,6 +1178,7 @@ class AuthorityStoreTests(unittest.TestCase):
             connection.close()
         AuthorityStore.migrate_v2_to_v3(self.path)
         AuthorityStore.migrate_v3_to_v4(self.path)
+        AuthorityStore.migrate_v4_to_v5(self.path)
         with AuthorityStore.open_existing(self.path) as store:
             self.assertEqual(store.read_generation("scope/A"), 3)
             self.assertEqual(store.acquire_generation("scope/A"), 4)
@@ -1290,10 +1295,20 @@ class AuthorityStoreTests(unittest.TestCase):
             connection.close()
 
     # U1E migration tests.
-    def test_migrate_v3_to_v4_ends_at_exact_v4(self):
+    def test_migrate_v3_to_v4_ends_at_exact_historical_v4(self):
         self._create_v3_store(generation_rows=(("S",2),),execution_keys=("K",),bindings=(("K","H"),))
         AuthorityStore.migrate_v3_to_v4(self.path)
-        with AuthorityStore.open_existing(self.path) as store: self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone(),(4,))
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (4,))
+            self.assertEqual(
+                connection.execute("SELECT name FROM sqlite_schema WHERE name='execution_launches'").fetchall(),
+                [],
+            )
+        finally:
+            connection.close()
+        with self.assertRaises(AuthorityStoreMigrationRequiredError):
+            AuthorityStore.open_existing(self.path)
 
     def test_v3_to_v4_preserves_generation_rows_exactly(self):
         rows=[("A",3),("B",9)]; self._create_v3_store(generation_rows=rows)
@@ -1322,7 +1337,7 @@ class AuthorityStoreTests(unittest.TestCase):
     def test_v3_to_v4_wrong_versions_reject(self):
         v1=self._new_path("v1.db"); self._create_v1_store(v1)
         v2=self._new_path("v2.db"); self._create_v2_store(v2)
-        v4=self._new_path("v4.db"); AuthorityStore.initialize_new(v4).close()
+        v4=self._new_path("v4.db"); self._create_v3_store(v4); AuthorityStore.migrate_v3_to_v4(v4)
         bad=self._new_path("bad.db"); self._create_v3_store(bad); c=sqlite3.connect(bad); c.execute("PRAGMA user_version=999"); c.commit(); c.close()
         for path in (v1,v2,v4,bad):
             with self.assertRaises(AuthorityStoreVersionError): AuthorityStore.migrate_v3_to_v4(path)
@@ -1556,7 +1571,7 @@ class AuthorityStoreTests(unittest.TestCase):
         with mock.patch.object(AuthorityStore, "_connect_rw", side_effect=connect):
             with mock.patch.object(
                 AuthorityStore,
-                "_validate_current_store",
+                "_validate_v4_store",
                 side_effect=AuthorityStoreMalformedError("injected validation failure"),
             ):
                 with mock.patch.object(

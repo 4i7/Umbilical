@@ -173,7 +173,7 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
         )
         self.assertNotEqual(normal, swapped)
 
-    def test_derived_key_integrates_with_current_v4_authority_schema(self):
+    def test_derived_key_integrates_with_current_v5_authority_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "authority.sqlite3"
             key = self._derive(
@@ -191,7 +191,7 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
                 )
                 self.assertTrue(store.execution_key_exists(key))
                 self.assertEqual(
-                    store._connection.execute("PRAGMA user_version").fetchone(), (4,)
+                    store._connection.execute("PRAGMA user_version").fetchone(), (5,)
                 )
                 self.assertEqual(
                     store._connection.execute(
@@ -203,6 +203,7 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
                         ("table", "execution_admissions"),
                         ("table", "execution_command_bindings"),
                         ("table", "execution_keys"),
+                        ("table", "execution_launches"),
                     ],
                 )
                 self.assertEqual(
@@ -222,6 +223,13 @@ class CanonicalExecutionIdentityTests(unittest.TestCase):
                     store._connection.execute(
                         "SELECT execution_key, authority_scope, controller_generation "
                         "FROM execution_admissions"
+                    ).fetchall(),
+                    [],
+                )
+                self.assertEqual(
+                    store._connection.execute(
+                        "SELECT execution_key, launch_state, exit_code "
+                        "FROM execution_launches"
                     ).fetchall(),
                     [],
                 )

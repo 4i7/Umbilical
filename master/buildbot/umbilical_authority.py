@@ -33,8 +33,11 @@ PathLike = Union[str, os.PathLike[str]]
 _V1_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
 _V3_SCHEMA_VERSION = 3
-_SCHEMA_VERSION = 4
+_V4_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _MAX_GENERATION = (1 << 63) - 1
+_MIN_SQLITE_INTEGER = -(1 << 63)
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 _CREATE_GENERATIONS_SQL = """
 CREATE TABLE controller_generations (
@@ -68,6 +71,31 @@ CREATE TABLE execution_admissions (
         CHECK(
             typeof(controller_generation) = 'integer'
             AND controller_generation > 0
+        )
+) WITHOUT ROWID
+"""
+_CREATE_EXECUTION_LAUNCHES_SQL = """
+CREATE TABLE execution_launches (
+    execution_key TEXT NOT NULL PRIMARY KEY
+        CHECK(typeof(execution_key) = 'text' AND execution_key <> ''),
+    command_spec_hash TEXT NOT NULL
+        CHECK(typeof(command_spec_hash) = 'text' AND command_spec_hash <> ''),
+    authority_scope TEXT NOT NULL
+        CHECK(typeof(authority_scope) = 'text' AND authority_scope <> ''),
+    controller_generation INTEGER NOT NULL
+        CHECK(
+            typeof(controller_generation) = 'integer'
+            AND controller_generation > 0
+        ),
+    launch_state TEXT NOT NULL
+        CHECK(
+            typeof(launch_state) = 'text'
+            AND launch_state IN ('intent', 'unknown', 'terminal')
+        ),
+    exit_code INTEGER
+        CHECK(
+            (launch_state IN ('intent', 'unknown') AND exit_code IS NULL)
+            OR (launch_state = 'terminal' AND typeof(exit_code) = 'integer')
         )
 ) WITHOUT ROWID
 """
@@ -113,12 +141,32 @@ class ExecutionKeyNotCommandBoundError(AuthorityStoreError):
     """Raised when execution admission requires an immutable command binding."""
 
 
+class CommandSpecHashMismatchError(AuthorityStoreError):
+    """Raised when a concrete U1F command does not match the immutable U1D binding."""
+
+
 class ControllerGenerationNotCurrentError(AuthorityStoreError):
     """Raised when expected ControllerGeneration is not current in the write fence."""
 
 
 class ExecutionAdmissionConflictError(AuthorityStoreError):
     """Raised when an ExecutionKey already has a different durable admission."""
+
+
+class ExecutionAdmissionMissingError(AuthorityStoreError):
+    """Raised when U1F launch claiming requires a durable execution admission."""
+
+
+class ExecutionAdmissionMismatchError(AuthorityStoreError):
+    """Raised when U1F launch claiming does not exactly match durable admission."""
+
+
+class ExecutionLaunchAlreadyClaimedError(AuthorityStoreError):
+    """Raised whenever physical launch authority was already irreversibly consumed."""
+
+
+class ExecutionLaunchStateError(AuthorityStoreError):
+    """Raised when a launch-state transition is not legal for an existing claim."""
 
 
 class InvalidAuthorityScopeError(ValueError):
@@ -135,6 +183,10 @@ class InvalidCommandSpecHashError(ValueError):
 
 class InvalidControllerGenerationError(ValueError):
     """Raised when a caller supplies a value outside ControllerGeneration domain."""
+
+
+class InvalidProcessExitCodeError(ValueError):
+    """Raised when terminal process observation is not an exact SQLite INTEGER."""
 
 
 class ExecutionKeyRegistration(Enum):
@@ -158,6 +210,14 @@ class ExecutionAdmissionResult(Enum):
     ALREADY_ADMITTED = "already_admitted"
 
 
+class ExecutionLaunchState(Enum):
+    """Durable physical-launch evidence; no state restores launch authority."""
+
+    INTENT = "intent"
+    UNKNOWN = "unknown"
+    TERMINAL = "terminal"
+
+
 @dataclass(frozen=True)
 class ExecutionAdmission:
     """Immutable durable admission observation; not a launch token."""
@@ -165,6 +225,18 @@ class ExecutionAdmission:
     execution_key: ExecutionKey
     authority_scope: AuthorityScope
     controller_generation: int
+
+
+@dataclass(frozen=True)
+class ExecutionLaunch:
+    """Immutable launch observation; existence means launch authority is consumed."""
+
+    execution_key: ExecutionKey
+    command_spec_hash: CommandSpecHash
+    authority_scope: AuthorityScope
+    controller_generation: int
+    state: ExecutionLaunchState
+    exit_code: Optional[int]
 
 
 class AuthorityStore:
@@ -206,6 +278,7 @@ class AuthorityStore:
             connection.execute(_CREATE_EXECUTION_KEYS_SQL)
             connection.execute(_CREATE_EXECUTION_COMMAND_BINDINGS_SQL)
             connection.execute(_CREATE_EXECUTION_ADMISSIONS_SQL)
+            connection.execute(_CREATE_EXECUTION_LAUNCHES_SQL)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             cls._validate_store(connection)
             connection.execute("COMMIT")
@@ -278,15 +351,28 @@ class AuthorityStore:
 
     @classmethod
     def migrate_v3_to_v4(cls, path: PathLike) -> None:
-        """Explicitly migrate one exact valid v3 store to exact current v4."""
+        """Explicitly migrate one exact valid v3 store to exact historical v4."""
         cls._migrate_one_table(
             path,
             source_version=_V3_SCHEMA_VERSION,
-            target_version=_SCHEMA_VERSION,
+            target_version=_V4_SCHEMA_VERSION,
             migration_name="v3-to-v4",
             source_validator=cls._validate_v3_store,
-            target_validator=cls._validate_current_store,
+            target_validator=cls._validate_v4_store,
             create_sql=_CREATE_EXECUTION_ADMISSIONS_SQL,
+        )
+
+    @classmethod
+    def migrate_v4_to_v5(cls, path: PathLike) -> None:
+        """Explicitly migrate one exact valid v4 store to exact current v5."""
+        cls._migrate_one_table(
+            path,
+            source_version=_V4_SCHEMA_VERSION,
+            target_version=_SCHEMA_VERSION,
+            migration_name="v4-to-v5",
+            source_validator=cls._validate_v4_store,
+            target_validator=cls._validate_current_store,
+            create_sql=_CREATE_EXECUTION_LAUNCHES_SQL,
         )
 
     @classmethod
@@ -424,6 +510,11 @@ class AuthorityStore:
             raise AuthorityStoreMigrationRequiredError(
                 "authority schema version 3 requires explicit v3-to-v4 migration"
             )
+        if version == _V4_SCHEMA_VERSION:
+            cls._validate_v4_store(connection)
+            raise AuthorityStoreMigrationRequiredError(
+                "authority schema version 4 requires explicit v4-to-v5 migration"
+            )
         cls._validate_current_store(connection)
 
     @classmethod
@@ -436,10 +527,12 @@ class AuthorityStore:
                 "execution_admissions": _CREATE_EXECUTION_ADMISSIONS_SQL,
                 "execution_command_bindings": _CREATE_EXECUTION_COMMAND_BINDINGS_SQL,
                 "execution_keys": _CREATE_EXECUTION_KEYS_SQL,
+                "execution_launches": _CREATE_EXECUTION_LAUNCHES_SQL,
             },
             validate_execution_keys=True,
             validate_command_bindings=True,
             validate_admissions=True,
+            validate_launches=True,
         )
 
     @classmethod
@@ -451,6 +544,7 @@ class AuthorityStore:
             validate_execution_keys=False,
             validate_command_bindings=False,
             validate_admissions=False,
+            validate_launches=False,
         )
 
     @classmethod
@@ -465,6 +559,7 @@ class AuthorityStore:
             validate_execution_keys=True,
             validate_command_bindings=False,
             validate_admissions=False,
+            validate_launches=False,
         )
 
     @classmethod
@@ -480,6 +575,24 @@ class AuthorityStore:
             validate_execution_keys=True,
             validate_command_bindings=True,
             validate_admissions=False,
+            validate_launches=False,
+        )
+
+    @classmethod
+    def _validate_v4_store(cls, connection: sqlite3.Connection) -> None:
+        cls._validate_exact_store(
+            connection,
+            expected_version=_V4_SCHEMA_VERSION,
+            expected_objects={
+                "controller_generations": _CREATE_GENERATIONS_SQL,
+                "execution_admissions": _CREATE_EXECUTION_ADMISSIONS_SQL,
+                "execution_command_bindings": _CREATE_EXECUTION_COMMAND_BINDINGS_SQL,
+                "execution_keys": _CREATE_EXECUTION_KEYS_SQL,
+            },
+            validate_execution_keys=True,
+            validate_command_bindings=True,
+            validate_admissions=True,
+            validate_launches=False,
         )
 
     @classmethod
@@ -492,6 +605,7 @@ class AuthorityStore:
         validate_execution_keys: bool,
         validate_command_bindings: bool,
         validate_admissions: bool,
+        validate_launches: bool,
     ) -> None:
         try:
             integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
@@ -547,6 +661,8 @@ class AuthorityStore:
                 cls._validate_execution_command_bindings_table(connection)
             if validate_admissions:
                 cls._validate_execution_admissions_table(connection)
+            if validate_launches:
+                cls._validate_execution_launches_table(connection)
         except AuthorityStoreError:
             raise
         except sqlite3.DatabaseError as exc:
@@ -686,6 +802,106 @@ class AuthorityStore:
                     "persisted execution admission generation exceeds current generation"
                 )
 
+    @classmethod
+    def _validate_execution_launches_table(
+        cls, connection: sqlite3.Connection
+    ) -> None:
+        columns = connection.execute("PRAGMA table_info(execution_launches)").fetchall()
+        expected = [
+            (0, "execution_key", "TEXT", 1, None, 1),
+            (1, "command_spec_hash", "TEXT", 1, None, 0),
+            (2, "authority_scope", "TEXT", 1, None, 0),
+            (3, "controller_generation", "INTEGER", 1, None, 0),
+            (4, "launch_state", "TEXT", 1, None, 0),
+            (5, "exit_code", "INTEGER", 0, None, 0),
+        ]
+        if columns != expected:
+            raise AuthorityStoreMalformedError(
+                "execution_launches columns do not match U1F schema"
+            )
+        rows = connection.execute(
+            "SELECT l.execution_key, typeof(l.execution_key), "
+            "l.command_spec_hash, typeof(l.command_spec_hash), "
+            "l.authority_scope, typeof(l.authority_scope), "
+            "l.controller_generation, typeof(l.controller_generation), "
+            "l.launch_state, typeof(l.launch_state), "
+            "l.exit_code, typeof(l.exit_code), "
+            "e.execution_key, b.command_spec_hash, "
+            "a.authority_scope, a.controller_generation, "
+            "g.generation, typeof(g.generation) "
+            "FROM execution_launches AS l "
+            "LEFT JOIN execution_keys AS e ON e.execution_key = l.execution_key "
+            "LEFT JOIN execution_command_bindings AS b "
+            "ON b.execution_key = l.execution_key "
+            "LEFT JOIN execution_admissions AS a "
+            "ON a.execution_key = l.execution_key "
+            "LEFT JOIN controller_generations AS g "
+            "ON g.scope = l.authority_scope"
+        ).fetchall()
+        for (
+            execution_key,
+            key_type,
+            command_spec_hash,
+            hash_type,
+            authority_scope,
+            scope_type,
+            controller_generation,
+            generation_type,
+            launch_state,
+            launch_state_type,
+            exit_code,
+            exit_code_type,
+            registered_key,
+            bound_hash,
+            admitted_scope,
+            admitted_generation,
+            current_generation,
+            current_generation_type,
+        ) in rows:
+            key = cls._validate_persisted_execution_key(execution_key, key_type)
+            command_hash = cls._validate_persisted_command_spec_hash(
+                command_spec_hash, hash_type
+            )
+            scope = cls._validate_persisted_scope(authority_scope, scope_type)
+            generation = cls._validate_persisted_generation(
+                controller_generation, generation_type
+            )
+            state = cls._validate_persisted_launch_state(
+                launch_state, launch_state_type
+            )
+            cls._validate_persisted_exit_code(exit_code, exit_code_type, state)
+            if registered_key is None:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch references an unregistered ExecutionKey"
+                )
+            if bound_hash is None or bound_hash != command_hash:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch does not match immutable CommandSpecHash binding"
+                )
+            if admitted_scope is None or admitted_generation is None:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch references a missing execution admission"
+                )
+            if admitted_scope != scope or admitted_generation != generation:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch does not exactly match execution admission"
+                )
+            if current_generation is None:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch references a missing authority scope"
+                )
+            current = cls._validate_persisted_generation(
+                current_generation, current_generation_type
+            )
+            if generation > current:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch generation exceeds current generation"
+                )
+            if registered_key != key:
+                raise AuthorityStoreMalformedError(
+                    "persisted launch ExecutionKey relation is not exact"
+                )
+
     @staticmethod
     def _validate_scope(scope: AuthorityScope) -> None:
         # Preserve accepted AuthorityScope runtime semantics: str subclasses are accepted.
@@ -719,6 +935,18 @@ class AuthorityStore:
                 "ControllerGeneration must be a positive SQLite INTEGER value"
             )
         return generation
+
+    @staticmethod
+    def _validate_process_exit_code(exit_code: object) -> int:
+        if (
+            type(exit_code) is not int
+            or exit_code < _MIN_SQLITE_INTEGER
+            or exit_code > _MAX_SQLITE_INTEGER
+        ):
+            raise InvalidProcessExitCodeError(
+                "process exit code must be an exact SQLite INTEGER value"
+            )
+        return exit_code
 
     @staticmethod
     def _validate_persisted_scope(scope: object, sqlite_type: object) -> str:
@@ -767,6 +995,43 @@ class AuthorityStore:
                 "persisted ControllerGeneration exceeds SQLite INTEGER range"
             )
         return generation
+
+    @staticmethod
+    def _validate_persisted_launch_state(
+        launch_state: object, sqlite_type: object
+    ) -> ExecutionLaunchState:
+        if sqlite_type != "text" or type(launch_state) is not str:
+            raise AuthorityStoreMalformedError(
+                "persisted launch state must be an exact TEXT value"
+            )
+        try:
+            return ExecutionLaunchState(launch_state)
+        except ValueError as exc:
+            raise AuthorityStoreMalformedError(
+                "persisted launch state is unsupported"
+            ) from exc
+
+    @staticmethod
+    def _validate_persisted_exit_code(
+        exit_code: object,
+        sqlite_type: object,
+        state: ExecutionLaunchState,
+    ) -> Optional[int]:
+        if state in (ExecutionLaunchState.INTENT, ExecutionLaunchState.UNKNOWN):
+            if exit_code is not None or sqlite_type != "null":
+                raise AuthorityStoreMalformedError(
+                    "non-terminal launch state must not carry an exit code"
+                )
+            return None
+        if sqlite_type != "integer" or type(exit_code) is not int:
+            raise AuthorityStoreMalformedError(
+                "terminal launch state requires an INTEGER exit code"
+            )
+        if exit_code < _MIN_SQLITE_INTEGER or exit_code > _MAX_SQLITE_INTEGER:
+            raise AuthorityStoreMalformedError(
+                "persisted exit code exceeds SQLite INTEGER range"
+            )
+        return exit_code
 
     @staticmethod
     def _rollback_if_needed(connection: sqlite3.Connection) -> None:
@@ -831,6 +1096,23 @@ class AuthorityStore:
             raise AuthorityStoreError(
                 "authority transaction rollback failed; store permanently poisoned"
             ) from exc
+
+    def _handle_consequential_failure(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        commit_started: bool,
+        operation: str,
+        cause: BaseException,
+    ) -> None:
+        if commit_started:
+            self._poison()
+            raise AuthorityStoreError(
+                f"{operation} COMMIT outcome is uncertain; physical launch authority "
+                "must be treated as consumed until durable state is inspected"
+            ) from cause
+        self._rollback_after_failure(connection)
+        raise cause
 
     def acquire_generation(self, scope: AuthorityScope) -> int:
         """Atomically acquire the next durable generation for *scope*."""
@@ -1229,6 +1511,333 @@ class AuthorityStore:
         except sqlite3.DatabaseError as exc:
             self._rollback_after_failure(connection)
             raise AuthorityStoreError("execution admission read failed") from exc
+
+    def claim_execution_launch(
+        self,
+        execution_key: ExecutionKey,
+        authority_scope: AuthorityScope,
+        expected_generation: object,
+        command_spec_hash: CommandSpecHash,
+    ) -> ExecutionLaunch:
+        """Irreversibly consume one key's physical-launch authority under the fence."""
+        connection = self._require_usable_connection()
+        self._validate_execution_key(execution_key)
+        self._validate_scope(authority_scope)
+        generation = self._validate_controller_generation(expected_generation)
+        self._validate_command_spec_hash(command_spec_hash)
+        commit_started = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store(connection)
+
+            registered = connection.execute(
+                "SELECT execution_key, typeof(execution_key) "
+                "FROM execution_keys WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if registered is None:
+                raise ExecutionKeyNotRegisteredError(
+                    "launch claim requires a registered ExecutionKey"
+                )
+            persisted_key = self._validate_persisted_execution_key(
+                registered[0], registered[1]
+            )
+            if persisted_key != execution_key:
+                raise AuthorityStoreMalformedError(
+                    "ExecutionKey lookup violated exact identity semantics"
+                )
+
+            binding = connection.execute(
+                "SELECT command_spec_hash, typeof(command_spec_hash) "
+                "FROM execution_command_bindings WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if binding is None:
+                raise ExecutionKeyNotCommandBoundError(
+                    "launch claim requires an immutable CommandSpecHash binding"
+                )
+            bound_hash = self._validate_persisted_command_spec_hash(
+                binding[0], binding[1]
+            )
+            if bound_hash != command_spec_hash:
+                raise CommandSpecHashMismatchError(
+                    "concrete command does not match immutable CommandSpecHash binding"
+                )
+
+            admission = connection.execute(
+                "SELECT authority_scope, typeof(authority_scope), "
+                "controller_generation, typeof(controller_generation) "
+                "FROM execution_admissions WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if admission is None:
+                raise ExecutionAdmissionMissingError(
+                    "launch claim requires a durable ExecutionAdmission"
+                )
+            admitted_scope = self._validate_persisted_scope(admission[0], admission[1])
+            admitted_generation = self._validate_persisted_generation(
+                admission[2], admission[3]
+            )
+            if admitted_scope != authority_scope or admitted_generation != generation:
+                raise ExecutionAdmissionMismatchError(
+                    "launch claim must exactly match durable ExecutionAdmission"
+                )
+
+            generation_row = connection.execute(
+                "SELECT generation, typeof(generation) "
+                "FROM controller_generations WHERE scope = ?",
+                (authority_scope,),
+            ).fetchone()
+            if generation_row is None:
+                raise ControllerGenerationNotCurrentError(
+                    "admitted ControllerGeneration is no longer current"
+                )
+            current_generation = self._validate_persisted_generation(
+                generation_row[0], generation_row[1]
+            )
+            if current_generation != generation:
+                raise ControllerGenerationNotCurrentError(
+                    "admitted ControllerGeneration is no longer current"
+                )
+
+            prior = connection.execute(
+                "SELECT execution_key FROM execution_launches WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if prior is not None:
+                raise ExecutionLaunchAlreadyClaimedError(
+                    "ExecutionKey physical launch authority is already consumed"
+                )
+
+            connection.execute(
+                "INSERT INTO execution_launches"
+                "(execution_key, command_spec_hash, authority_scope, "
+                "controller_generation, launch_state, exit_code) "
+                "VALUES (?, ?, ?, ?, 'intent', NULL)",
+                (execution_key, command_spec_hash, authority_scope, generation),
+            )
+            result = ExecutionLaunch(
+                execution_key=execution_key,
+                command_spec_hash=command_spec_hash,
+                authority_scope=authority_scope,
+                controller_generation=generation,
+                state=ExecutionLaunchState.INTENT,
+                exit_code=None,
+            )
+            commit_started = True
+            connection.execute("COMMIT")
+            return result
+        except AuthorityStoreError as exc:
+            self._handle_consequential_failure(
+                connection,
+                commit_started=commit_started,
+                operation="execution launch claim",
+                cause=exc,
+            )
+            raise AssertionError("unreachable")
+        except sqlite3.DatabaseError as exc:
+            self._handle_consequential_failure(
+                connection,
+                commit_started=commit_started,
+                operation="execution launch claim",
+                cause=exc,
+            )
+            raise AssertionError("unreachable")
+
+    def mark_execution_launch_unknown(
+        self,
+        execution_key: ExecutionKey,
+        command_spec_hash: CommandSpecHash,
+    ) -> ExecutionLaunch:
+        """Persist UNKNOWN before entering the external process-launch boundary."""
+        connection = self._require_usable_connection()
+        self._validate_execution_key(execution_key)
+        self._validate_command_spec_hash(command_spec_hash)
+        commit_started = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store(connection)
+            row = self._read_launch_row(connection, execution_key)
+            if row is None:
+                raise ExecutionLaunchStateError("launch intent does not exist")
+            launch = self._execution_launch_from_row(row)
+            if launch.command_spec_hash != command_spec_hash:
+                raise CommandSpecHashMismatchError(
+                    "launch state does not match concrete CommandSpecHash"
+                )
+            if launch.state is not ExecutionLaunchState.INTENT:
+                raise ExecutionLaunchStateError(
+                    "only a fresh durable launch intent can transition to UNKNOWN"
+                )
+            cursor = connection.execute(
+                "UPDATE execution_launches SET launch_state = 'unknown' "
+                "WHERE execution_key = ? AND command_spec_hash = ? "
+                "AND launch_state = 'intent' AND exit_code IS NULL",
+                (execution_key, command_spec_hash),
+            )
+            if cursor.rowcount != 1:
+                raise AuthorityStoreMalformedError(
+                    "UNKNOWN transition did not affect exactly one launch row"
+                )
+            result = ExecutionLaunch(
+                execution_key=launch.execution_key,
+                command_spec_hash=launch.command_spec_hash,
+                authority_scope=launch.authority_scope,
+                controller_generation=launch.controller_generation,
+                state=ExecutionLaunchState.UNKNOWN,
+                exit_code=None,
+            )
+            commit_started = True
+            connection.execute("COMMIT")
+            return result
+        except AuthorityStoreError as exc:
+            self._handle_consequential_failure(
+                connection,
+                commit_started=commit_started,
+                operation="execution launch UNKNOWN transition",
+                cause=exc,
+            )
+            raise AssertionError("unreachable")
+        except sqlite3.DatabaseError as exc:
+            self._handle_consequential_failure(
+                connection,
+                commit_started=commit_started,
+                operation="execution launch UNKNOWN transition",
+                cause=exc,
+            )
+            raise AssertionError("unreachable")
+
+    def record_execution_terminal_result(
+        self,
+        execution_key: ExecutionKey,
+        command_spec_hash: CommandSpecHash,
+        exit_code: object,
+    ) -> ExecutionLaunch:
+        """Record one known process exit exactly once without restoring authority."""
+        connection = self._require_usable_connection()
+        self._validate_execution_key(execution_key)
+        self._validate_command_spec_hash(command_spec_hash)
+        terminal_exit_code = self._validate_process_exit_code(exit_code)
+        commit_started = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store(connection)
+            row = self._read_launch_row(connection, execution_key)
+            if row is None:
+                raise ExecutionLaunchStateError("launch claim does not exist")
+            launch = self._execution_launch_from_row(row)
+            if launch.command_spec_hash != command_spec_hash:
+                raise CommandSpecHashMismatchError(
+                    "terminal result does not match launch CommandSpecHash"
+                )
+            if launch.state is not ExecutionLaunchState.UNKNOWN:
+                raise ExecutionLaunchStateError(
+                    "terminal result requires a durable UNKNOWN launch state"
+                )
+            cursor = connection.execute(
+                "UPDATE execution_launches SET launch_state = 'terminal', exit_code = ? "
+                "WHERE execution_key = ? AND command_spec_hash = ? "
+                "AND launch_state = 'unknown' AND exit_code IS NULL",
+                (terminal_exit_code, execution_key, command_spec_hash),
+            )
+            if cursor.rowcount != 1:
+                raise AuthorityStoreMalformedError(
+                    "terminal transition did not affect exactly one launch row"
+                )
+            result = ExecutionLaunch(
+                execution_key=launch.execution_key,
+                command_spec_hash=launch.command_spec_hash,
+                authority_scope=launch.authority_scope,
+                controller_generation=launch.controller_generation,
+                state=ExecutionLaunchState.TERMINAL,
+                exit_code=terminal_exit_code,
+            )
+            commit_started = True
+            connection.execute("COMMIT")
+            return result
+        except AuthorityStoreError as exc:
+            self._handle_consequential_failure(
+                connection,
+                commit_started=commit_started,
+                operation="execution terminal-result transition",
+                cause=exc,
+            )
+            raise AssertionError("unreachable")
+        except sqlite3.DatabaseError as exc:
+            self._handle_consequential_failure(
+                connection,
+                commit_started=commit_started,
+                operation="execution terminal-result transition",
+                cause=exc,
+            )
+            raise AssertionError("unreachable")
+
+    def read_execution_launch(
+        self, execution_key: ExecutionKey
+    ) -> Optional[ExecutionLaunch]:
+        """Observe durable launch history; every returned state has consumed authority."""
+        connection = self._require_usable_connection()
+        self._validate_execution_key(execution_key)
+        try:
+            connection.execute("BEGIN")
+            self._validate_store(connection)
+            registered = connection.execute(
+                "SELECT execution_key, typeof(execution_key) "
+                "FROM execution_keys WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if registered is None:
+                raise ExecutionKeyNotRegisteredError(
+                    "execution launch read requires a registered ExecutionKey"
+                )
+            persisted_key = self._validate_persisted_execution_key(
+                registered[0], registered[1]
+            )
+            if persisted_key != execution_key:
+                raise AuthorityStoreMalformedError(
+                    "ExecutionKey lookup violated exact identity semantics"
+                )
+            row = self._read_launch_row(connection, execution_key)
+            launch = None if row is None else self._execution_launch_from_row(row)
+            connection.execute("COMMIT")
+            return launch
+        except AuthorityStoreError:
+            self._rollback_after_failure(connection)
+            raise
+        except sqlite3.DatabaseError as exc:
+            self._rollback_after_failure(connection)
+            raise AuthorityStoreError("execution launch read failed") from exc
+
+    @staticmethod
+    def _read_launch_row(
+        connection: sqlite3.Connection, execution_key: ExecutionKey
+    ) -> Optional[tuple]:
+        return connection.execute(
+            "SELECT execution_key, typeof(execution_key), "
+            "command_spec_hash, typeof(command_spec_hash), "
+            "authority_scope, typeof(authority_scope), "
+            "controller_generation, typeof(controller_generation), "
+            "launch_state, typeof(launch_state), exit_code, typeof(exit_code) "
+            "FROM execution_launches WHERE execution_key = ?",
+            (execution_key,),
+        ).fetchone()
+
+    @classmethod
+    def _execution_launch_from_row(cls, row: tuple) -> ExecutionLaunch:
+        execution_key = cls._validate_persisted_execution_key(row[0], row[1])
+        command_spec_hash = cls._validate_persisted_command_spec_hash(row[2], row[3])
+        authority_scope = cls._validate_persisted_scope(row[4], row[5])
+        controller_generation = cls._validate_persisted_generation(row[6], row[7])
+        state = cls._validate_persisted_launch_state(row[8], row[9])
+        exit_code = cls._validate_persisted_exit_code(row[10], row[11], state)
+        return ExecutionLaunch(
+            execution_key=execution_key,
+            command_spec_hash=command_spec_hash,
+            authority_scope=authority_scope,
+            controller_generation=controller_generation,
+            state=state,
+            exit_code=exit_code,
+        )
 
     def close(self) -> None:
         connection = self._connection
