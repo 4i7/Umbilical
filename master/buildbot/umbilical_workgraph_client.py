@@ -445,6 +445,7 @@ def run_workgraph_client(
         _run_integrity_preflight(preflight_spec)
         if _contract_tree() != contract_tree:
             raise WorkGraphClientError("Umbilical validation contract changed after preflight")
+        _verify_clean_checkout(checkout, target)
         command_hash = command_spec_hash(command_spec)
         if not exists:
             store.register_execution_key(execution_key)

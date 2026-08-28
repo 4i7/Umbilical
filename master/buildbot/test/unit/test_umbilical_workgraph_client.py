@@ -68,7 +68,7 @@ class WorkGraphClientTests(unittest.TestCase):
             client, "verify_workgraph_target", return_value=target
         ), mock.patch.object(
             client, "prepare_exact_checkout", return_value=self.checkout
-        ), mock.patch.object(
+        ), mock.patch.object(client, "_verify_clean_checkout"), mock.patch.object(
             client, "_contract_tree", return_value=_CONTRACT_TREE_A
         ), mock.patch.object(client, "_run_integrity_preflight"), mock.patch.object(
             SubprocessLocalProcessLauncher, "launch", return_value=launcher
@@ -269,6 +269,54 @@ class WorkGraphClientTests(unittest.TestCase):
             self.assertFalse(store.execution_key_exists(execution_key))
         execute.assert_not_called()
 
+    def test_workgraph_checkout_is_rechecked_after_preflight_before_authority(self):
+        self._initialize()
+        target = self._target()
+        execution_key = client.derive_execution_key(
+            repository_identity="github-repository-id:1338331328",
+            subject_identity=client._SUBJECT,
+            revision_identity=_REVISION_A,
+            causal_root=client.validation_contract_id(_CONTRACT_TREE_A),
+        )
+        drift_cases = {
+            "HEAD": ("0" * 40,),
+            "TREE": (_REVISION_A, "0" * 40),
+            "DIRTY": (_REVISION_A, _TREE_A, "M changed"),
+        }
+        for name, git_outputs in drift_cases.items():
+            publisher = mock.Mock()
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ, {"GH_TOKEN": "test-token"}
+            ), mock.patch.object(
+                client, "_deployment_root", return_value=self.deployment_root
+            ), mock.patch.object(
+                client, "verify_workgraph_target", return_value=target
+            ), mock.patch.object(
+                client, "_contract_tree", return_value=_CONTRACT_TREE_A
+            ), mock.patch.object(
+                client, "prepare_exact_checkout", return_value=self.checkout
+            ), mock.patch.object(client, "_run_integrity_preflight"), mock.patch.object(
+                client, "_run_git", side_effect=git_outputs
+            ), mock.patch.object(
+                AuthorityStore, "register_execution_key"
+            ) as register, mock.patch.object(
+                AuthorityStore, "bind_command_spec_hash"
+            ) as bind, mock.patch.object(
+                AuthorityStore, "admit_execution"
+            ) as admit, mock.patch.object(
+                client, "execute_local_command"
+            ) as execute, mock.patch.object(SubprocessLocalProcessLauncher, "launch") as launch:
+                with self.assertRaises(client.WorkGraphClientError):
+                    client.run_workgraph_client(self._request(), publisher=publisher)
+            register.assert_not_called()
+            bind.assert_not_called()
+            admit.assert_not_called()
+            execute.assert_not_called()
+            launch.assert_not_called()
+            publisher.assert_not_called()
+            with AuthorityStore.open_existing(self.authority_db) as store:
+                self.assertFalse(store.execution_key_exists(execution_key))
+
     def test_deployment_paths_and_command_hash_ignore_environment_drift(self):
         known_local_app_data = self.root / "known-local-app-data"
         runtime = Path(sys.executable).resolve()
@@ -398,7 +446,7 @@ class WorkGraphClientTests(unittest.TestCase):
             client, "verify_workgraph_target", return_value=self._target()
         ), mock.patch.object(
             client, "prepare_exact_checkout", return_value=self.checkout
-        ), mock.patch.object(
+        ), mock.patch.object(client, "_verify_clean_checkout"), mock.patch.object(
             client, "_contract_tree", return_value=_CONTRACT_TREE_A
         ), mock.patch.object(client, "_run_integrity_preflight"), mock.patch.object(
             client, "execute_local_command", side_effect=RuntimeError("crash before launch")
@@ -413,7 +461,7 @@ class WorkGraphClientTests(unittest.TestCase):
             client, "verify_workgraph_target", return_value=self._target(_REVISION_B, _TREE_B)
         ), mock.patch.object(
             client, "prepare_exact_checkout", return_value=self.checkout
-        ), mock.patch.object(
+        ), mock.patch.object(client, "_verify_clean_checkout"), mock.patch.object(
             client, "_contract_tree", return_value=_CONTRACT_TREE_A
         ), mock.patch.object(client, "_run_integrity_preflight"), mock.patch.object(
             SubprocessLocalProcessLauncher, "launch", return_value=0
@@ -427,7 +475,7 @@ class WorkGraphClientTests(unittest.TestCase):
             client, "verify_workgraph_target", return_value=self._target()
         ), mock.patch.object(
             client, "prepare_exact_checkout", return_value=self.checkout
-        ), mock.patch.object(
+        ), mock.patch.object(client, "_verify_clean_checkout"), mock.patch.object(
             client, "_contract_tree", return_value=_CONTRACT_TREE_A
         ), mock.patch.object(client, "_run_integrity_preflight"), mock.patch.object(
             SubprocessLocalProcessLauncher, "launch", return_value=0
@@ -493,7 +541,7 @@ class WorkGraphClientTests(unittest.TestCase):
             client, "verify_workgraph_target", return_value=self._target()
         ), mock.patch.object(
             client, "prepare_exact_checkout", return_value=self.checkout
-        ), mock.patch.object(
+        ), mock.patch.object(client, "_verify_clean_checkout"), mock.patch.object(
             client, "_contract_tree", return_value=_CONTRACT_TREE_A
         ), mock.patch.object(client, "_run_integrity_preflight"), mock.patch.object(
             SubprocessLocalProcessLauncher, "launch", side_effect=OSError("lost")
