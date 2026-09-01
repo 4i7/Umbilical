@@ -1,6 +1,6 @@
-psycopg2-binary==2.9.10
-mysqlclient==2.2.6
-pg8000==1.31.2
+psycopg2-binary==2.9.12
+mysqlclient==2.2.8
+pg8000==1.31.5
 
 # The following are transitive dependencies of the above. The versions are pinned so that tests
 # are reproducible. The versions should be upgraded whenever we see new versions to catch problems
@@ -8,4 +8,4 @@ pg8000==1.31.2
 # while to remove no longer needed dependencies.
 
 asn1crypto==1.5.1
-scramp==1.4.5
+scramp==1.4.17
